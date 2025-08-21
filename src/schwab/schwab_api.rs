@@ -1,13 +1,19 @@
 use std::{fmt, fs, sync::Arc};
 
 use reqwest::{
-    header::{HeaderMap, HeaderValue},
     Client,
+    header::{HeaderMap, HeaderValue},
 };
 
-use crate::{schwab::{common::TOKENS_FILE, schwab_auth::StoredTokenInfo}, util::dedup_ordered};
-
-const SCHWAB_MARKET_DATA_API_URL: &str = "https://api.schwabapi.com/marketdata/v1";
+use crate::{
+    schwab::{
+        common::SCHWAB_MARKET_DATA_API_URL, 
+        common::SCHWAB_TRADER_API_URL, 
+        common::TOKENS_FILE, 
+        schwab_auth::StoredTokenInfo,
+    },
+    util::dedup_ordered,
+};
 
 /// Represents the type of contract for an options chain.
 pub enum ContractType {
@@ -112,7 +118,7 @@ impl SchwabApi {
         symbols: Vec<String>,
         fields: Option<Vec<QuoteFields>>,
         indicative: Option<bool>,
-    ) -> anyhow::Result<(), anyhow::Error> {
+    ) -> anyhow::Result<String, anyhow::Error> {
         let symbols_string = symbols.join(",");
         let fields_string = match fields {
             Some(v) => dedup_ordered(v)
@@ -127,7 +133,7 @@ impl SchwabApi {
             None => "".to_owned(),
         };
 
-        let headers = SchwabApi::construct_request_headers().unwrap();
+        let headers = SchwabApi::construct_request_headers()?;
 
         let response = self
             .reqwest_client
@@ -139,13 +145,19 @@ impl SchwabApi {
             .send()
             .await?;
 
-        println!("Get quotes response: {:?}", response.status());
-
         let response_json = response.text().await?;
 
-        println!("Quotes: {:?}", response_json);
+        Ok(response_json)
+    }
 
-        Ok(())
+    pub async fn get_preferences(&self) -> anyhow::Result<String, anyhow::Error> {
+        let headers = SchwabApi::construct_request_headers()?;
+        let response = self.reqwest_client
+            .get(format!("{SCHWAB_TRADER_API_URL}/userPreference"))
+            .headers(headers)
+            .send()
+            .await?;
+        Ok(response.text().await?)
     }
 
     /// Gets an options chain for a symbol.
@@ -188,7 +200,6 @@ impl SchwabApi {
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -240,11 +251,18 @@ mod tests {
         let strike_count = 5;
         let include_underlying_quote = true;
 
-        let result = api.get_chains(symbol, contract_type, strike_count, include_underlying_quote).await;
+        let result = api
+            .get_chains(
+                symbol,
+                contract_type,
+                strike_count,
+                include_underlying_quote,
+            )
+            .await;
 
         // Assert that the API call was successful.
         assert!(result.is_ok());
-        
+
         Ok(())
     }
 }
