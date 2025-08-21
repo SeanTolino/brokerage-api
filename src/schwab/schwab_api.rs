@@ -10,7 +10,7 @@ use urlencoding::encode;
 
 use crate::{
     schwab::{
-        common::{SCHWAB_MARKET_DATA_API_URL, TOKENS_FILE},
+        common::{SCHWAB_MARKET_DATA_API_URL, SCHWAB_TRADER_API_URL, TOKENS_FILE},
         schwab_auth::StoredTokenInfo,
     },
     util::{dedup_ordered, parse_params, time_to_epoch_ms, time_to_yyyymmdd},
