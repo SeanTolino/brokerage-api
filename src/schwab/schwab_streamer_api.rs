@@ -1,12 +1,21 @@
 use std::{collections::HashMap, fmt, fs};
 
 use anyhow::anyhow;
-use serde_json::{json, Value};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use futures_util::{stream::{SplitSink, SplitStream}, SinkExt, StreamExt};
-use tokio::net::TcpStream;
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
+use serde_json::{Value, json};
+use tokio::{io::AsyncWriteExt, net::TcpStream, task::JoinHandle};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use crate::{schwab::{common::{SCHWAB_STREAMER_API_URL, TOKENS_FILE}, schwab_auth::StoredTokenInfo}, SchwabApi};
+use crate::{
+    SchwabApi,
+    schwab::{
+        common::{SCHWAB_STREAMER_API_URL, TOKENS_FILE},
+        schwab_auth::StoredTokenInfo,
+    },
+};
 
 #[derive(Debug)]
 pub enum Command {
@@ -55,19 +64,39 @@ pub struct StreamRequest {
     fields: Vec<String>,
 }
 
+impl StreamRequest {
+    pub fn new(
+        service: Service,
+        command: Command,
+        keys: Vec<String>,
+        fields: Vec<String>,
+    ) -> Self {
+        Self {
+            service,
+            command,
+            keys,
+            fields,
+        }
+    }
+}
+
 pub struct SchwabStreamerApi {
     schwab_api: SchwabApi,
     request_id: i64,
     streamer_info: Value,
     subscriptions: HashMap<Service, HashMap<String, Vec<String>>>,
     writer: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
+    listener_handle: Option<JoinHandle<()>>,
 }
 
 impl SchwabStreamerApi {
     pub async fn new(schwab_api: SchwabApi) -> anyhow::Result<Self, anyhow::Error> {
         let user_preferences = schwab_api.get_preferences().await?;
         let streamer_info = serde_json::from_str::<Value>(&user_preferences.as_str())?;
-        let streamer_info = match streamer_info.get("streamerInfo").and_then(|info| info.get(0)) {
+        let streamer_info = match streamer_info
+            .get("streamerInfo")
+            .and_then(|info| info.get(0))
+        {
             Some(i) => i,
             None => {
                 return Err(anyhow!("Unable to read streamer info"));
@@ -79,30 +108,42 @@ impl SchwabStreamerApi {
             streamer_info: streamer_info.clone(),
             subscriptions: HashMap::new(),
             writer: None,
+            listener_handle: None,
         })
     }
 
-    pub async fn send_requests(&mut self, stream_requests: Vec<StreamRequest>) -> anyhow::Result<(), anyhow::Error> {
+    pub async fn send_requests(
+        &mut self,
+        stream_requests: Vec<StreamRequest>,
+    ) -> anyhow::Result<(), anyhow::Error> {
         let mut requests = Vec::new();
         for stream_request in stream_requests {
             let parameters = json!({
                 "keys": stream_request.keys.join(","),
                 "fields": stream_request.fields.join(","),
             });
-            let request = self.build_message(stream_request.service, stream_request.command, parameters)?;
+            let request =
+                self.build_message(stream_request.service, stream_request.command, parameters)?;
             requests.push(request);
         }
 
         if let Some(writer) = self.writer.as_mut() {
             for request in requests {
-                writer.send(Message::Text(request.to_string().into())).await?;
+                writer
+                    .send(Message::Text(request.to_string().into()))
+                    .await?;
             }
         }
 
         Ok(())
     }
 
-    pub fn level_one_options(&mut self, keys: Vec<String>, fields: Vec<String>, command: Command) -> anyhow::Result<Value, anyhow::Error> {
+    pub fn level_one_options(
+        &mut self,
+        keys: Vec<String>,
+        fields: Vec<String>,
+        command: Command,
+    ) -> anyhow::Result<Value, anyhow::Error> {
         let parameters = json!({
             "parameters": {
                 "keys": keys,
@@ -110,6 +151,31 @@ impl SchwabStreamerApi {
             }
         });
         Ok(self.build_message(Service::LevelOneOptions, command, parameters)?)
+    }
+
+    pub async fn start(&mut self) -> anyhow::Result<()> {
+        let read = self.connect().await?;
+        let listener = tokio::spawn(async move {
+            read.for_each(|message| async {
+                println!("receiving...");
+                let data = message.unwrap().into_data();
+                tokio::io::stdout().write(&data).await.unwrap();
+                println!("received...");
+            })
+            .await;
+        });
+        self.listener_handle = Some(listener);
+        Ok(())
+    }
+
+    pub async fn stop(&mut self) -> anyhow::Result<()> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.close().await?;
+        }
+        if let Some(handle) = self.listener_handle.take() {
+            handle.abort();
+        }
+        Ok(())
     }
 
     fn record_request(&mut self, stream_request: StreamRequest) {
@@ -133,7 +199,7 @@ impl SchwabStreamerApi {
                         }
                     }
                 }
-            },
+            }
             Command::Subs => {
                 let service = self.subscriptions.get_mut(&service);
                 if let Some(s) = service {
@@ -141,7 +207,7 @@ impl SchwabStreamerApi {
                         s.insert(key, fields.clone());
                     }
                 }
-            },
+            }
             Command::Unsubs => {
                 let service = self.subscriptions.get_mut(&service);
                 if let Some(s) = service {
@@ -149,17 +215,20 @@ impl SchwabStreamerApi {
                         s.remove(&key);
                     }
                 }
-            },
+            }
             Command::View => {
                 panic!("VIEW command not implemented");
-            },
+            }
             _ => {
                 panic!("{}", format!("{} is an unsupported command", command));
             }
         }
-    } 
+    }
 
-    pub async fn connect(&mut self) -> anyhow::Result<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>, anyhow::Error> {
+    async fn connect(
+        &mut self,
+    ) -> anyhow::Result<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>, anyhow::Error>
+    {
         let schwab_client_channel = match self.streamer_info.get("schwabClientChannel") {
             Some(i) => i,
             None => {
@@ -176,8 +245,7 @@ impl SchwabStreamerApi {
         let data: StoredTokenInfo = serde_json::from_str(&json_string)?;
         let auth_header = format!("{}", data.access_token.as_str());
 
-        let (ws_stream, _response) =
-            connect_async(SCHWAB_STREAMER_API_URL)
+        let (ws_stream, _response) = connect_async(SCHWAB_STREAMER_API_URL)
             .await
             .expect("Failed to connect to stream API");
 
@@ -188,15 +256,21 @@ impl SchwabStreamerApi {
             "SchwabClientFunctionId": schwab_client_function_id,
         });
         let message = self.build_message(Service::Admin, Command::Login, parameters)?;
-        println!("MESSAGE ===> {:?}", message);
-        write.send(Message::Text(message.to_string().into())).await?;
+        write
+            .send(Message::Text(message.to_string().into()))
+            .await?;
 
         self.writer = Some(write);
 
         Ok(read)
     }
 
-    fn build_message(&mut self, service: Service, command: Command, parameters: Value) -> anyhow::Result<Value, anyhow::Error> {
+    fn build_message(
+        &mut self,
+        service: Service,
+        command: Command,
+        parameters: Value,
+    ) -> anyhow::Result<Value, anyhow::Error> {
         let schwab_client_customer_id = match self.streamer_info.get("schwabClientCustomerId") {
             Some(i) => i,
             None => {
@@ -229,8 +303,7 @@ mod test {
     use reqwest::Client;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{schwab::schwab_streamer_api::SchwabStreamerApi, SchwabApi, SchwabAuth};
-
+    use crate::{SchwabApi, SchwabAuth, schwab::schwab_streamer_api::SchwabStreamerApi};
 
     #[tokio::test]
     async fn test_conn() -> anyhow::Result<(), anyhow::Error> {
@@ -242,16 +315,10 @@ mod test {
         let app_key = std::env::var("SCHWAB_APP_KEY")?;
         let app_secret = std::env::var("SCHWAB_APP_SECRET")?;
         schwab_auth.authorize(&app_key, &app_secret).await?;
-        
-        let read = streamer_api.connect().await?;
-        let read_future = read.for_each(|message| async {
-            println!("receiving...");
-            let data = message.unwrap().into_data();
-            tokio::io::stdout().write(&data).await.unwrap();
-            println!("received...");
-        });
 
-        read_future.await;
+        streamer_api.start().await?;
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        streamer_api.stop().await?;
         Ok(())
     }
 }
