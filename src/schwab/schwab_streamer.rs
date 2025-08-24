@@ -1,6 +1,7 @@
-use std::{collections::HashMap, fmt, fs};
+use std::{collections::HashMap, fmt, fs, ops::Deref, sync::{atomic::AtomicBool, Arc}};
 
 use anyhow::anyhow;
+use async_std::sync::Mutex;
 use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
@@ -17,7 +18,7 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Add,
     Subs,
@@ -80,16 +81,17 @@ impl StreamRequest {
     }
 }
 
-pub struct SchwabStreamerApi {
+pub struct SchwabStreamer {
     schwab_api: SchwabApi,
     request_id: i64,
     streamer_info: Value,
     subscriptions: HashMap<Service, HashMap<String, Vec<String>>>,
     writer: Option<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>,
-    listener_handle: Option<JoinHandle<()>>,
+    listener_handle: Option<Arc<JoinHandle<()>>>,
+    is_active: Arc<AtomicBool>,
 }
 
-impl SchwabStreamerApi {
+impl SchwabStreamer {
     pub async fn new(schwab_api: SchwabApi) -> anyhow::Result<Self, anyhow::Error> {
         let user_preferences = schwab_api.get_preferences().await?;
         let streamer_info = serde_json::from_str::<Value>(&user_preferences.as_str())?;
@@ -109,7 +111,69 @@ impl SchwabStreamerApi {
             subscriptions: HashMap::new(),
             writer: None,
             listener_handle: None,
+            is_active: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    pub async fn default() -> anyhow::Result<Self, anyhow::Error> {
+        let schwab_api = SchwabApi::default();
+        SchwabStreamer::new(schwab_api).await
+    }
+
+    pub async fn start(&mut self) -> anyhow::Result<(), anyhow::Error> {
+        let read = self.connect().await?;
+        let is_active_for_listener = Arc::clone(&self.is_active);
+        let listener = tokio::spawn(async move {
+            read.for_each(|message| {
+                let is_active_clone = Arc::clone(&is_active_for_listener);
+                async move {
+                    if let Ok(msg) = message {
+                        if let Ok(text) = msg.into_text() {
+                            if let Ok(json_data) = serde_json::from_str::<Value>(&text) {
+                                println!("{:?}", json_data);
+                                if let Some(response_val) = json_data.get("response") {
+                                    if let Some(response_array) = response_val.as_array() {
+                                        for r in response_array {
+                                            if let Some(command_val) = r.get("command") {
+                                                if let Some(command_str) = command_val.as_str() {
+                                                    if command_str == Command::Login.to_string() {
+                                                        if let Some(code) = r.get("content").and_then(|content| content.get("code")) {
+                                                            if code == 0 {
+                                                                is_active_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                                                            }
+                                                        }
+                                                        
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }).await;
+        });
+        self.listener_handle = Some(Arc::new(listener));
+        Ok(())
+    }
+
+    pub fn get_listener(&self) -> Option<Arc<JoinHandle<()>>> {
+        match &self.listener_handle {
+            Some(handle) => Some(Arc::clone(&handle)),
+            None => None
+        }
+    }
+
+    pub async fn stop(&mut self) -> anyhow::Result<()> {
+        if let Some(writer) = self.writer.as_mut() {
+            writer.close().await?;
+        }
+        if let Some(handle) = self.listener_handle.take() {
+            handle.abort();
+        }
+        Ok(())
     }
 
     pub async fn send_requests(
@@ -129,6 +193,7 @@ impl SchwabStreamerApi {
 
         if let Some(writer) = self.writer.as_mut() {
             for request in requests {
+                println!("Sending request: {:?}", request);
                 writer
                     .send(Message::Text(request.to_string().into()))
                     .await?;
@@ -153,29 +218,8 @@ impl SchwabStreamerApi {
         Ok(self.build_message(Service::LevelOneOptions, command, parameters)?)
     }
 
-    pub async fn start(&mut self) -> anyhow::Result<()> {
-        let read = self.connect().await?;
-        let listener = tokio::spawn(async move {
-            read.for_each(|message| async {
-                println!("receiving...");
-                let data = message.unwrap().into_data();
-                tokio::io::stdout().write(&data).await.unwrap();
-                println!("received...");
-            })
-            .await;
-        });
-        self.listener_handle = Some(listener);
-        Ok(())
-    }
-
-    pub async fn stop(&mut self) -> anyhow::Result<()> {
-        if let Some(writer) = self.writer.as_mut() {
-            writer.close().await?;
-        }
-        if let Some(handle) = self.listener_handle.take() {
-            handle.abort();
-        }
-        Ok(())
+    pub fn is_active(&self) -> bool {
+        self.is_active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn record_request(&mut self, stream_request: StreamRequest) {
@@ -250,6 +294,7 @@ impl SchwabStreamerApi {
             .expect("Failed to connect to stream API");
 
         let (mut write, read) = ws_stream.split();
+        // let read = Arc::new(read);
         let parameters = json!({
             "Authorization": auth_header,
             "SchwabClientChannel": schwab_client_channel,
@@ -303,14 +348,14 @@ mod test {
     use reqwest::Client;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{SchwabApi, SchwabAuth, schwab::schwab_streamer_api::SchwabStreamerApi};
+    use crate::{SchwabApi, SchwabAuth, schwab::schwab_streamer::SchwabStreamer};
 
     #[tokio::test]
     async fn test_conn() -> anyhow::Result<(), anyhow::Error> {
         let reqwest_client = Arc::new(Client::new());
         let schwab_auth = SchwabAuth::new(Arc::clone(&reqwest_client));
         let schwab_api = SchwabApi::new(Arc::clone(&reqwest_client));
-        let mut streamer_api = SchwabStreamerApi::new(schwab_api).await?;
+        let mut streamer_api = SchwabStreamer::new(schwab_api).await?;
 
         let app_key = std::env::var("SCHWAB_APP_KEY")?;
         let app_secret = std::env::var("SCHWAB_APP_SECRET")?;

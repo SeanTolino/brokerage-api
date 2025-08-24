@@ -217,9 +217,7 @@ impl SchwabApi {
         }
     }
 
-    /// Creates a new `SchwabApi` instance with default settings.
-    ///
-    /// This uses a default `reqwest::Client` and the default `TOKENS_FILE` path.
+    /// Constructs the request headers for a Schwab API request.
     ///
     /// # Returns
     ///
