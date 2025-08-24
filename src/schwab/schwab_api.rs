@@ -81,6 +81,12 @@ impl SchwabApi {
         Self { reqwest_client }
     }
 
+    pub fn default() -> Self {
+        Self {
+            reqwest_client: Arc::new(Client::new())
+        }
+    }
+
     /// Constructs the request headers for a Schwab API request.
     ///
     /// # Returns
