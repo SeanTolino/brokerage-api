@@ -84,12 +84,6 @@ impl SchwabAuth {
         }
     }
 
-    pub fn default() -> Self {
-        Self {
-            reqwest_client: Arc::new(Client::new())
-        }
-    }
-
     /// Guides the user through the Schwab API authorization process.
     ///
     /// This method constructs the authorization URL, prompts the user to log in and authorize the application,

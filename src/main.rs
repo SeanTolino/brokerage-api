@@ -1,8 +1,16 @@
-use std::{sync::Arc, thread::sleep, time::Duration};
+use std::{
+    sync::Arc,
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
-use brokerage_api::{schwab::schwab_streamer::{Command, Service, StreamRequest}, SchwabApi, SchwabAuth, SchwabStreamer};
+use brokerage_api::{
+    SchwabApi, SchwabAuth, SchwabStreamer,
+    schwab::schwab_streamer::{Command, Service, StreamRequest},
+};
+use chrono::Utc;
 use reqwest::Client;
-
+use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), anyhow::Error> {
@@ -13,25 +21,29 @@ async fn main() -> anyhow::Result<(), anyhow::Error> {
 
     // schwab_auth.authorize(&app_key, &app_secret).await?;
     schwab_auth.refresh_tokens(&app_key, &app_secret).await?;
-    
+
     let mut streamer_api = SchwabStreamer::default().await?;
-    streamer_api.start().await?;
     // TODO: send_requests should queue up the requests using record_request method, and there should be an async handler that runs periodically
     // to send all queued up requests. This way the client doesn't have to do the management of knowing when streamer is_active vs not, to decide
     // if it's safe to send a request.
     let mut request_sent = false;
-    loop {
+    while request_sent == false {
         if !streamer_api.is_active() {
-            println!("is_active is false, continuing");
             continue;
         }
+        println!("[{:?}] Login succeeded", Utc::now());
+        // println!("[{:?}] Sleeping for 15 seconds", Utc::now());
+        // sleep(Duration::from_secs(15));
         if request_sent == false {
-            println!("SENDING REQUEST!");
-            let stream_requests = vec![
-                StreamRequest::new(Service::LevelOneEquities, Command::Subs, vec!["AMZN".to_owned()], vec![])
-            ];
+            println!("[{:?}] Sending SUBS request", Utc::now());
+            let stream_requests = vec![streamer_api.level_one_equities(
+                vec!["NVDA".to_owned()],
+                vec![],
+                Command::Subs,
+            )?];
             streamer_api.send_requests(stream_requests).await?;
             request_sent = true;
         }
     }
+    loop {}
 }

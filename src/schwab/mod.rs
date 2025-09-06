@@ -8,4 +8,5 @@
 pub mod schwab_api;
 pub mod schwab_streamer;
 pub mod schwab_auth;
+pub mod model;
 mod common;

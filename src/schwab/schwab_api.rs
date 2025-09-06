@@ -282,6 +282,18 @@ impl SchwabApi {
         Ok(response_json)
     }
 
+    pub async fn get_preferences(&self) -> anyhow::Result<Value, anyhow::Error> {
+        let headers = self.construct_request_headers().await?;
+        let response = self.reqwest_client
+            .get(format!("{SCHWAB_TRADER_API_URL}/userPreference"))
+            .headers(headers)
+            .send()
+            .await?;
+
+        let response_json = serde_json::from_str(response.text().await?.as_str())?;
+        Ok(response_json)
+    }
+
     /// Gets an options chain for a symbol.
     ///
     /// # Arguments
