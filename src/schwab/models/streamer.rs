@@ -1,7 +1,16 @@
+// src/schwab/models/streamer.rs
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
+pub enum StreamerMessage {
+    LevelOneEquity(LevelOneEquitiesResponse),
+    LevelOneOption(LevelOneOptionsResponse),
+    // We can add more variants here for other data types in the future
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub enum LevelOneOptionsField {
     Symbol,
@@ -125,7 +134,7 @@ impl fmt::Display for LevelOneOptionsField {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub enum LevelOneEquitiesField {
     Symbol,
@@ -154,7 +163,7 @@ pub enum LevelOneEquitiesField {
     DividendYield,
     Nav,
     ExchangeName,
-    DueDate, // Changed from DividendDate to DueDate to avoid conflict with field name
+    DueDate,
     RegularMarketQuote,
     RegularMarketTrade,
     RegularMarketLastPrice,
@@ -241,118 +250,233 @@ impl fmt::Display for LevelOneEquitiesField {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct LevelOneOptionsResponseFields {
-    symbol: String,
-    description: String,
-    bid_price: f64,
-    ask_price: f64,
-    last_price: f64,
-    high_price: f64,
-    low_price: f64,
-    close_price: f64,
-    total_volume: i64,
-    open_interest: i64,
-    volatility: f64,
-    money_intrinsic_value: f64,
-    expiration_year: i64,
-    multiplier: f64,
-    digits: i64,
-    open_price: f64,
-    bid_size: i64,
-    ask_size: i64,
-    last_size: i64,
-    net_change: f64,
-    strike_price: f64,
-    contract_type: char,
-    underlying: String,
-    expiration_month: i64,
-    deliverables: String,
-    time_value: f64,
-    expiration_day: i64,
-    days_to_expiration: i64,
-    delta: f64,
-    gamma: f64,
-    theta: f64,
-    vega: f64,
-    rho: f64,
-    security_status: String,
-    theoretical_option_value: f64,
-    underlying_price: f64,
-    uv_expiration_type: char,
-    mark_price: f64,
-    quote_time_in_long: i64,
-    trade_time_in_long: i64,
-    exchange: char,
-    exchange_name: String,
-    last_trading_day: i64,
-    settlement_type: char,
-    net_percent_change: f64,
-    mark_price_net_change: f64,
-    mark_price_percent_change: f64,
-    implied_yield: f64,
-    is_penny_pilot: bool,
-    option_root: String,
-    fifty_two_week_high: f64,
-    fifty_two_week_low: f64,
-    indicative_ask_price: f64,
-    indicative_bid_price: f64,
-    indicative_quote_time: i64,
-    exercise_type: char,
+// --- FIXED: Added #[serde(rename = ...)] attributes to all fields ---
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LevelOneOptionsResponse {
+    #[serde(rename = "key")]
+    pub symbol: String,
+    #[serde(rename = "1")]
+    pub description: Option<String>,
+    #[serde(rename = "2")]
+    pub bid_price: Option<f64>,
+    #[serde(rename = "3")]
+    pub ask_price: Option<f64>,
+    #[serde(rename = "4")]
+    pub last_price: Option<f64>,
+    #[serde(rename = "5")]
+    pub high_price: Option<f64>,
+    #[serde(rename = "6")]
+    pub low_price: Option<f64>,
+    #[serde(rename = "7")]
+    pub close_price: Option<f64>,
+    #[serde(rename = "8")]
+    pub total_volume: Option<i64>,
+    #[serde(rename = "9")]
+    pub open_interest: Option<i64>,
+    #[serde(rename = "10")]
+    pub volatility: Option<f64>,
+    #[serde(rename = "11")]
+    pub money_intrinsic_value: Option<f64>,
+    #[serde(rename = "12")]
+    pub expiration_year: Option<i64>,
+    #[serde(rename = "13")]
+    pub multiplier: Option<f64>,
+    #[serde(rename = "14")]
+    pub digits: Option<i64>,
+    #[serde(rename = "15")]
+    pub open_price: Option<f64>,
+    #[serde(rename = "16")]
+    pub bid_size: Option<i64>,
+    #[serde(rename = "17")]
+    pub ask_size: Option<i64>,
+    #[serde(rename = "18")]
+    pub last_size: Option<i64>,
+    #[serde(rename = "19")]
+    pub net_change: Option<f64>,
+    #[serde(rename = "20")]
+    pub strike_price: Option<f64>,
+    #[serde(rename = "21")]
+    pub contract_type: Option<String>, // "CALL" or "PUT"
+    #[serde(rename = "22")]
+    pub underlying: Option<String>,
+    #[serde(rename = "23")]
+    pub expiration_month: Option<i64>,
+    #[serde(rename = "24")]
+    pub deliverables: Option<String>,
+    #[serde(rename = "25")]
+    pub time_value: Option<f64>,
+    #[serde(rename = "26")]
+    pub expiration_day: Option<i64>,
+    #[serde(rename = "27")]
+    pub days_to_expiration: Option<i64>,
+    #[serde(rename = "28")]
+    pub delta: Option<f64>,
+    #[serde(rename = "29")]
+    pub gamma: Option<f64>,
+    #[serde(rename = "30")]
+    pub theta: Option<f64>,
+    #[serde(rename = "31")]
+    pub vega: Option<f64>,
+    #[serde(rename = "32")]
+    pub rho: Option<f64>,
+    #[serde(rename = "33")]
+    pub security_status: Option<String>,
+    #[serde(rename = "34")]
+    pub theoretical_option_value: Option<f64>,
+    #[serde(rename = "35")]
+    pub underlying_price: Option<f64>,
+    #[serde(rename = "36")]
+    pub uv_expiration_type: Option<String>,
+    #[serde(rename = "37")]
+    pub mark_price: Option<f64>,
+    #[serde(rename = "38")]
+    pub quote_time_in_long: Option<i64>,
+    #[serde(rename = "39")]
+    pub trade_time_in_long: Option<i64>,
+    #[serde(rename = "40")]
+    pub exchange: Option<String>,
+    #[serde(rename = "41")]
+    pub exchange_name: Option<String>,
+    #[serde(rename = "42")]
+    pub last_trading_day: Option<i64>,
+    #[serde(rename = "43")]
+    pub settlement_type: Option<String>,
+    #[serde(rename = "44")]
+    pub net_percent_change: Option<f64>,
+    #[serde(rename = "45")]
+    pub mark_price_net_change: Option<f64>,
+    #[serde(rename = "46")]
+    pub mark_price_percent_change: Option<f64>,
+    #[serde(rename = "47")]
+    pub implied_yield: Option<f64>,
+    #[serde(rename = "48")]
+    pub is_penny_pilot: Option<bool>,
+    #[serde(rename = "49")]
+    pub option_root: Option<String>,
+    #[serde(rename = "50")]
+    pub fifty_two_week_high: Option<f64>,
+    #[serde(rename = "51")]
+    pub fifty_two_week_low: Option<f64>,
+    #[serde(rename = "52")]
+    pub indicative_ask_price: Option<f64>,
+    #[serde(rename = "53")]
+    pub indicative_bid_price: Option<f64>,
+    #[serde(rename = "54")]
+    pub indicative_quote_time: Option<i64>,
+    #[serde(rename = "55")]
+    pub exercise_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct LevelOneEquitiesFields {
-    symbol: String,
-    bid_price: f64,
-    ask_price: f64,
-    last_price: f64,
-    bid_size: i64,
-    ask_size: i64,
-    ask_id: char,
-    bid_id: char,
-    total_volume: i64,
-    last_size: i64,
-    high_price: f64,
-    low_price: f64,
-    close_price: f64,
-    exchange_id: char,
-    marginable: bool,
-    description: String,
-    last_id: char,
-    open_price: f64,
-    net_change: f64,
-    fifty_two_week_high: f64,
-    fifty_two_week_low: f64,
-    pe_ratio: f64,
-    annual_dividend_amount: f64,
-    dividend_yield: f64,
-    nav: f64,
-    exchange_name: String,
-    dividend_date: String,
-    regular_market_quote: bool,
-    regular_market_trade: bool,
-    regular_market_last_price: f64,
-    regular_market_last_size: i64,
-    regular_market_net_change: f64,
-    security_status: String,
-    mark_price: f64,
-    quote_time_in_long: i64,
-    trade_time_in_long: i64,
-    regular_market_trade_time_in_long: i64,
-    bid_time: i64,
-    ask_time: i64,
-    ask_mic_id: String,
-    bid_mic_id: String,
-    last_mic_id: String,
-    net_percent_change: f64,
-    regular_market_percent_change: f64,
-    mark_price_net_change: f64,
-    mark_price_percent_change: f64,
-    hard_to_borrow_quantity: i64,
-    hard_to_borrow_rate: f64,
-    hard_to_borrow: i64,
-    shortable: i64,
-    post_market_net_change: f64,
-    post_market_percent_change: f64,
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct LevelOneEquitiesResponse {
+    #[serde(rename = "key")]
+    pub symbol: String,
+    #[serde(rename = "1")]
+    pub bid_price: Option<f64>,
+    #[serde(rename = "2")]
+    pub ask_price: Option<f64>,
+    #[serde(rename = "3")]
+    pub last_price: Option<f64>,
+    #[serde(rename = "4")]
+    pub bid_size: Option<i64>,
+    #[serde(rename = "5")]
+    pub ask_size: Option<i64>,
+    #[serde(rename = "6")]
+    pub ask_id: Option<char>,
+    #[serde(rename = "7")]
+    pub bid_id: Option<char>,
+    #[serde(rename = "8")]
+    pub total_volume: Option<i64>,
+    #[serde(rename = "9")]
+    pub last_size: Option<i64>,
+    #[serde(rename = "10")]
+    pub high_price: Option<f64>,
+    #[serde(rename = "11")]
+    pub low_price: Option<f64>,
+    #[serde(rename = "12")]
+    pub close_price: Option<f64>,
+    #[serde(rename = "13")]
+    pub exchange_id: Option<String>,
+    #[serde(rename = "14")]
+    pub marginable: Option<bool>,
+    #[serde(rename = "15")]
+    pub description: Option<String>,
+    #[serde(rename = "16")]
+    pub last_id: Option<char>,
+    #[serde(rename = "17")]
+    pub open_price: Option<f64>,
+    #[serde(rename = "18")]
+    pub net_change: Option<f64>,
+    #[serde(rename = "19")]
+    pub fifty_two_week_high: Option<f64>,
+    #[serde(rename = "20")]
+    pub fifty_two_week_low: Option<f64>,
+    #[serde(rename = "21")]
+    pub pe_ratio: Option<f64>,
+    #[serde(rename = "22")]
+    pub annual_dividend_amount: Option<f64>,
+    #[serde(rename = "23")]
+    pub dividend_yield: Option<f64>,
+    #[serde(rename = "24")]
+    pub nav: Option<f64>,
+    #[serde(rename = "25")]
+    pub exchange_name: Option<String>,
+    #[serde(rename = "26")]
+    pub due_date: Option<String>,
+    #[serde(rename = "27")]
+    pub regular_market_quote: Option<bool>,
+    #[serde(rename = "28")]
+    pub regular_market_trade: Option<bool>,
+    #[serde(rename = "29")]
+    pub regular_market_last_price: Option<f64>,
+    #[serde(rename = "30")]
+    pub regular_market_last_size: Option<i64>,
+    #[serde(rename = "31")]
+    pub regular_market_net_change: Option<f64>,
+    #[serde(rename = "32")]
+    pub security_status: Option<String>,
+    #[serde(rename = "33")]
+    pub mark_price: Option<f64>,
+    #[serde(rename = "34")]
+    pub quote_time_in_long: Option<i64>,
+    #[serde(rename = "35")]
+    pub trade_time_in_long: Option<i64>,
+    #[serde(rename = "36")]
+    pub regular_market_trade_time_in_long: Option<i64>,
+    #[serde(rename = "37")]
+    pub bid_time: Option<i64>,
+    #[serde(rename = "38")]
+    pub ask_time: Option<i64>,
+    #[serde(rename = "39")]
+    pub ask_mic_id: Option<String>,
+    #[serde(rename = "40")]
+    pub bid_mic_id: Option<String>,
+    #[serde(rename = "41")]
+    pub last_mic_id: Option<String>,
+    #[serde(rename = "42")]
+    pub net_percent_change: Option<f64>,
+    #[serde(rename = "43")]
+    pub regular_market_percent_change: Option<f64>,
+    #[serde(rename = "44")]
+    pub mark_price_net_change: Option<f64>,
+    #[serde(rename = "45")]
+    pub mark_price_percent_change: Option<f64>,
+    #[serde(rename = "46")]
+    pub hard_to_borrow_quantity: Option<i64>,
+    #[serde(rename = "47")]
+    pub hard_to_borrow_rate: Option<f64>,
+    #[serde(rename = "48")]
+    pub hard_to_borrow: Option<i64>,
+    #[serde(rename = "49")]
+    pub shortable: Option<i64>,
+    #[serde(rename = "50")]
+    pub post_market_net_change: Option<f64>,
+    #[serde(rename = "51")]
+    pub post_market_percent_change: Option<f64>,
+    #[serde(rename = "assetMainType")]
+    pub asset_main_type: Option<String>,
+    #[serde(rename = "assetSubType")]
+    pub asset_sub_type: Option<String>,
+    pub cusip: Option<String>,
+    pub delayed: Option<bool>,
 }

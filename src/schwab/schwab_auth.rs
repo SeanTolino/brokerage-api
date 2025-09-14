@@ -1,13 +1,15 @@
+// src/schwab/schwab_auth.rs
+
 use std::{
     fs,
     io::{self, Write},
     sync::Arc,
 };
 
-use base64::{Engine, engine::general_purpose};
+use base64::{engine::general_purpose, Engine};
 use reqwest::{
-    Client,
     header::{HeaderMap, HeaderValue},
+    Client,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,7 +31,7 @@ struct RefreshRequestPayload {
 }
 
 /// Represents the token information stored in a local file.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)] // Added Clone
 #[allow(dead_code)]
 pub(crate) struct StoredTokenInfo {
     /// The access token.
@@ -47,7 +49,7 @@ pub(crate) struct StoredTokenInfo {
 }
 
 /// A client for handling the Schwab API authentication process.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SchwabAuth {
     reqwest_client: Arc<Client>,
     tokens_file_path: String,
@@ -142,41 +144,30 @@ impl SchwabAuth {
         Ok(())
     }
 
-    /// Refreshes the access token using the refresh token.
+    /// Refreshes the access token using the provided refresh token.
     ///
-    /// This method reads the refresh token from the local tokens file, and then uses it to request a new
-    /// access token. The new tokens are then saved to the local file.
-    ///
-    /// # Arguments
-    ///
-    /// * `app_key` - The application key.
-    /// * `secret` - The application secret.
-    /// Refreshes the access token using the stored refresh token.
-    ///
-    /// This method reads the refresh token from the local tokens file, and then uses it to request a new
-    /// access token and potentially a new refresh token. The newly obtained tokens are then saved to the local file.
+    /// This method requests a new access token from Schwab and returns the complete new token info.
+    /// It does NOT read from or write to the tokens file itself.
     ///
     /// # Arguments
     ///
-    /// * `app_key` - The application key (Client ID) provided by Schwab.
-    /// * `secret` - The application secret (Client Secret) provided by Schwab.
+    /// * `app_key` - The application key (Client ID).
+    /// * `secret` - The application secret (Client Secret).
+    /// * `refresh_token` - The refresh token to use for obtaining a new access token.
     ///
     /// # Returns
     ///
-    /// A `Result` indicating success (`Ok(())`) or an `anyhow::Error` if the token refresh process fails.
+    /// A `Result` containing the new `StoredTokenInfo`, or an `anyhow::Error` if the refresh fails.
     pub async fn refresh_tokens(
         &self,
         app_key: &str,
         secret: &str,
-    ) -> anyhow::Result<(), anyhow::Error> {
-        let json_string = fs::read_to_string(self.tokens_file_path.to_owned())?;
-        let data: StoredTokenInfo = serde_json::from_str(&json_string)?;
-
-        let refresh_token = data.refresh_token;
+        refresh_token: &str,
+    ) -> anyhow::Result<StoredTokenInfo> {
         let headers = self.construct_headers(app_key, secret);
-        let payload = self.construct_refresh_payload(refresh_token);
+        let payload = self.construct_refresh_payload(refresh_token.to_string());
 
-        let refresh_tokens_response = self
+        let response = self
             .reqwest_client
             .post(SCHWAB_TOKEN_URL)
             .headers(headers)
@@ -184,22 +175,17 @@ impl SchwabAuth {
             .send()
             .await?;
 
-        info!("Refresh tokens response: {:?}", refresh_tokens_response);
+        info!("Refresh tokens response status: {:?}", response.status());
 
-        if refresh_tokens_response.status() == 200 {
+        if response.status().is_success() {
             info!("Retrieved new tokens successfully using refresh token.");
-            let refresh_token_string = refresh_tokens_response.text().await?;
-            let refresh_token_json: StoredTokenInfo = serde_json::from_str(&refresh_token_string)?;
-            fs::write(
-                self.tokens_file_path.to_owned(),
-                serde_json::to_string_pretty(&refresh_token_json)?,
-            )?;
+            let new_token_info: StoredTokenInfo = response.json().await?;
+            Ok(new_token_info)
         } else {
-            info!("Failed to refresh tokens.");
-            return Err(anyhow::anyhow!("Failed to refresh tokens."));
+            let error_text = response.text().await?;
+            info!("Failed to refresh tokens: {}", error_text);
+            Err(anyhow::anyhow!("Failed to refresh tokens: {}", error_text))
         }
-
-        Ok(())
     }
 
     /// Extracts the authorization code from the redirect URL returned by the Schwab authorization server.

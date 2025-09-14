@@ -1,17 +1,24 @@
-use std::{fmt, sync::Arc};
+// src/schwab/schwab_api.rs
+
+use std::{env, fmt, sync::Arc};
 
 use chrono::{DateTime, Utc};
-use reqwest::{
-    Client,
-    header::{HeaderMap, HeaderValue},
-};
-use serde_json::Value;
+use reqwest::{header::HeaderMap, Client, RequestBuilder, Response, StatusCode};
+use tokio::sync::Mutex;
+use tracing::info;
 use urlencoding::encode;
 
 use crate::{
     schwab::{
         common::{SCHWAB_MARKET_DATA_API_URL, SCHWAB_TRADER_API_URL, TOKENS_FILE},
-        schwab_auth::StoredTokenInfo,
+        models::{
+            market_data::{
+                ChainsResponse, ExpirationChainResponse, InstrumentsResponse, MarketHours,
+                MarketHoursResponse, MoversResponse, PriceHistoryResponse, QuotesResponse,
+            },
+            trader::UserPreferencesResponse,
+        },
+        schwab_auth::{SchwabAuth, StoredTokenInfo},
     },
     util::{dedup_ordered, parse_params, time_to_epoch_ms, time_to_yyyymmdd},
 };
@@ -192,284 +199,224 @@ impl fmt::Display for MarketSymbol {
     }
 }
 
-/// A client for interacting with the Schwab API.
+/// A client for interacting with the Schwab API, with automatic token refreshing.
+#[derive(Debug, Clone)]
 pub struct SchwabApi {
     reqwest_client: Arc<Client>,
+    app_key: String,
+    app_secret: String,
     tokens_file_path: String,
+    auth: SchwabAuth,
+    token_info: Arc<Mutex<StoredTokenInfo>>,
 }
 
 impl SchwabApi {
     /// Creates a new `SchwabApi` instance.
     ///
     /// # Arguments
-    ///
-    /// * `reqwest_client` - An `Arc` wrapped `reqwest::Client` to be used for making HTTP requests.
-    /// * `base_url` - The base URL for the Schwab API.
-    /// * `tokens_file_path` - The path to the file where tokens are stored.
-    ///
-    /// # Returns
-    ///
-    /// A new `SchwabApi` instance.
-    pub fn new(reqwest_client: Arc<Client>, tokens_file_path: String) -> Self {
-        Self {
+    /// * `app_key` - Your Schwab application key (Client ID).
+    /// * `app_secret` - Your Schwab application secret (Client Secret).
+    /// * `tokens_file_path` - The path to where the `tokens.json` file is stored.
+    pub async fn new(
+        app_key: String,
+        app_secret: String,
+        tokens_file_path: String,
+    ) -> anyhow::Result<Self> {
+        let reqwest_client = Arc::new(Client::new());
+        let auth = SchwabAuth::new(reqwest_client.clone(), tokens_file_path.clone());
+
+        let json_string = tokio::fs::read_to_string(&tokens_file_path).await?;
+        let token_info: StoredTokenInfo = serde_json::from_str(&json_string)?;
+
+        Ok(Self {
             reqwest_client,
+            app_key,
+            app_secret,
             tokens_file_path,
-        }
+            auth,
+            token_info: Arc::new(Mutex::new(token_info)),
+        })
     }
 
-    /// Constructs the request headers for a Schwab API request.
-    ///
-    /// # Returns
-    ///
-    /// A new `SchwabApi` instance.
-    pub fn default() -> Self {
-        Self {
-            reqwest_client: Arc::new(Client::new()),
-            tokens_file_path: TOKENS_FILE.to_owned(),
-        }
+    /// Creates a new `SchwabApi` instance with default settings, loading credentials from environment variables.
+    /// It expects `SCHWAB_APP_KEY` and `SCHWAB_APP_SECRET` to be set.
+    pub async fn default() -> anyhow::Result<Self> {
+        let app_key = env::var("SCHWAB_APP_KEY")
+            .map_err(|_| anyhow::anyhow!("SCHWAB_APP_KEY environment variable not set"))?;
+        let app_secret = env::var("SCHWAB_APP_SECRET")
+            .map_err(|_| anyhow::anyhow!("SCHWAB_APP_SECRET environment variable not set"))?;
+        Self::new(app_key, app_secret, TOKENS_FILE.to_owned()).await
     }
 
-    /// Retrieves real-time quotes for a specified list of symbols.
-    ///
-    /// This method allows fetching various types of quote data (e.g., fundamental, extended)
-    /// and can optionally return indicative quotes.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbols` - A `Vec` of `String`s representing the ticker symbols for which to retrieve quotes.
-    /// * `fields` - An `Option`al `Vec` of `QuoteFields` to specify the data fields to include in the response.
-    ///              If `None`, default fields will be returned.
-    /// * `indicative` - An `Option`al `bool` to request indicative quotes. Set to `true` for indicative quotes.
-    ///                  If `None`, the default behavior of the API will be used.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the quote data, or an `anyhow::Error` if the request fails.
+    /// Centralized request sender that handles authentication and token refreshing.
+    async fn send_request(&self, mut builder: RequestBuilder) -> anyhow::Result<Response> {
+        // Sign the request with the current access token from memory
+        let headers = self.construct_request_headers().await?;
+        builder = builder.headers(headers);
+
+        // Clone the request before sending, so we can retry it if the token is expired
+        let retry_builder = builder
+            .try_clone()
+            .ok_or_else(|| anyhow::anyhow!("Failed to clone request for potential retry"))?;
+
+        // Send the initial request
+        let response = builder.send().await?;
+
+        // Check if the token expired (401 Unauthorized)
+        if response.status() == StatusCode::UNAUTHORIZED {
+            info!("Token expired. Attempting to refresh...");
+            self.refresh_and_store_token().await?;
+
+            // Re-sign the cloned request with the new token
+            let retry_headers = self.construct_request_headers().await?;
+            let response = retry_builder.headers(retry_headers).send().await?;
+
+            info!("Request successful after token refresh.");
+            return Ok(response);
+        }
+
+        Ok(response)
+    }
+
+    /// Refreshes the token, updates the in-memory store, and writes the new token to the file.
+    async fn refresh_and_store_token(&self) -> anyhow::Result<()> {
+        let refresh_token = {
+            let token_data = self.token_info.lock().await;
+            token_data.refresh_token.clone()
+        };
+
+        let new_token_info = self
+            .auth
+            .refresh_tokens(&self.app_key, &self.app_secret, &refresh_token)
+            .await?;
+
+        // Update the in-memory token
+        {
+            let mut token_data = self.token_info.lock().await;
+            *token_data = new_token_info.clone();
+        }
+
+        // Persist the new token to the file for future sessions
+        let json_string = serde_json::to_string_pretty(&new_token_info)?;
+        tokio::fs::write(&self.tokens_file_path, json_string).await?;
+        info!("Successfully refreshed and stored new token.");
+
+        Ok(())
+    }
+
+    /// Constructs the request headers from the in-memory token.
+    async fn construct_request_headers(&self) -> anyhow::Result<HeaderMap> {
+        let mut headers = HeaderMap::new();
+
+        let token_data = self.token_info.lock().await;
+        let auth_header = format!("Bearer {}", token_data.access_token);
+        headers.insert("Authorization", auth_header.parse()?);
+
+        Ok(headers)
+    }
+
+    // --- API Methods ---
+
+    pub async fn get_preferences(&self) -> anyhow::Result<UserPreferencesResponse> {
+        let builder = self
+            .reqwest_client
+            .get(format!("{SCHWAB_TRADER_API_URL}/userPreference"));
+
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
+    }
+
     pub async fn get_quotes(
         &self,
         symbols: Vec<String>,
         fields: Option<Vec<QuoteFields>>,
         indicative: Option<bool>,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let symbols_string = symbols.join(",");
-        let fields_string = match fields {
-            Some(v) => dedup_ordered(v)
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<String>>()
-                .join(","),
-            None => "".to_owned(),
-        };
-        let indicative_string = match indicative {
-            Some(v) => v.to_string().to_lowercase(),
-            None => "".to_owned(),
-        };
+    ) -> anyhow::Result<QuotesResponse> {
+        let url = format!("{}/quotes", SCHWAB_MARKET_DATA_API_URL);
 
-        let headers = self.construct_request_headers().await?;
+        let params = parse_params(vec![
+            ("symbols", Some(symbols.join(","))),
+            (
+                "fields",
+                fields.map(|v| {
+                    dedup_ordered(v)
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<String>>()
+                        .join(",")
+                }),
+            ),
+            ("indicative", indicative.map(|v| v.to_string().to_lowercase())),
+        ]);
 
-        let request_url = format!(
-            "{}/quotes?symbols={}&fields={}&indicative={}",
-            SCHWAB_MARKET_DATA_API_URL, symbols_string, fields_string, indicative_string
-        );
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .send()
-            .await?;
-
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    pub async fn get_preferences(&self) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
-        let response = self.reqwest_client
-            .get(format!("{SCHWAB_TRADER_API_URL}/userPreference"))
-            .headers(headers)
-            .send()
-            .await?;
-
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
-    }
-
-    /// Gets an options chain for a symbol.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - The symbol to get the options chain for.
-    /// * `contract_type` - The type of contract to get.
-    /// * `strike_count` - The number of strikes to return.
-    /// * `include_underlying_quote` - Whether to include the underlying quote in the response.
-    /// Retrieves an options chain for a given symbol.
-    ///
-    /// This method allows specifying the contract type, the number of strikes, and whether to
-    /// include the underlying quote in the response.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - The ticker symbol for which to retrieve the options chain.
-    /// * `contract_type` - The `ContractType` to filter the options chain (e.g., Call, Put, All).
-    /// * `strike_count` - The number of strikes to return around the current price.
-    /// * `include_underlying_quote` - A `bool` indicating whether to include the underlying stock's quote in the response.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the options chain data, or an `anyhow::Error` if the request fails.
     pub async fn get_chains(
         &self,
         symbol: String,
         contract_type: ContractType,
         strike_count: u64,
         include_underlying_quote: bool,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
+    ) -> anyhow::Result<ChainsResponse> {
+        let url = format!("{}/chains", SCHWAB_MARKET_DATA_API_URL);
 
-        let request_url = format!(
-            "{}/chains?symbol={}&contractType={}&strikeCount={}&includeUnderlyingQuote={}",
-            SCHWAB_MARKET_DATA_API_URL,
-            symbol,
-            contract_type.to_string(),
-            strike_count.to_string(),
-            include_underlying_quote.to_string()
-        );
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .send()
-            .await?;
+        let params = parse_params(vec![
+            ("symbol", Some(symbol)),
+            ("contractType", Some(contract_type.to_string())),
+            ("strikeCount", Some(strike_count.to_string())),
+            (
+                "includeUnderlyingQuote",
+                Some(include_underlying_quote.to_string()),
+            ),
+        ]);
 
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    /// Get quote for a single symbol.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol_id` - Ticker symbol.
-    /// * `fields` - Fields to get ("all", "quote", "fundamental").
-    /// Retrieves a quote for a single symbol.
-    ///
-    /// This method fetches detailed quote information for a specific ticker symbol,
-    /// with options to specify the desired fields.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol_id` - The ticker symbol for which to retrieve the quote.
-    /// * `fields` - An `Option`al `Vec` of `QuoteFields` to specify the data fields to include in the response.
-    ///              If `None`, default fields will be returned.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the quote data, or an `anyhow::Error` if the request fails.
     pub async fn quote(
         &self,
         symbol_id: String,
         fields: Option<Vec<QuoteFields>>,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
-
-        let fields_string = match fields {
-            Some(v) => dedup_ordered(v)
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<String>>()
-                .join(","),
-            None => "".to_owned(),
-        };
-
-        let params = parse_params(vec![("fields", Some(fields_string))]);
-
-        let request_url = format!(
+    ) -> anyhow::Result<QuotesResponse> {
+        let url = format!(
             "{}/{}/quotes",
             SCHWAB_MARKET_DATA_API_URL,
             encode(&symbol_id)
         );
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .query(&params)
-            .send()
-            .await?;
 
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let params = parse_params(vec![(
+            "fields",
+            fields.map(|v| {
+                dedup_ordered(v)
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<String>>()
+                    .join(",")
+            }),
+        )]);
+
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    /// Get an option expiration chain for a ticker.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - Ticker symbol.
-    /// Retrieves the option expiration chain for a given ticker symbol.
-    ///
-    /// This provides a list of available expiration dates for options contracts related to the symbol.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - The ticker symbol for which to retrieve the option expiration chain.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the option expiration chain data, or an `anyhow::Error` if the request fails.
     pub async fn option_expiration_chain(
         &self,
         symbol: String,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
-
+    ) -> anyhow::Result<ExpirationChainResponse> {
+        let url = format!("{}/expirationchain", SCHWAB_MARKET_DATA_API_URL);
         let params = parse_params(vec![("symbol", Some(symbol))]);
 
-        let request_url = format!("{}/expirationchain", SCHWAB_MARKET_DATA_API_URL);
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .query(&params)
-            .send()
-            .await?;
-
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    /// Get price history for a ticker.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - Ticker symbol.
-    /// * `period_type` - Period type ("day"|"month"|"year"|"ytd").
-    /// * `period` - Period.
-    /// * `frequency_type` - Frequency type ("minute"|"daily"|"weekly"|"monthly").
-    /// * `frequency` - Frequency (frequencyType: options), (minute: 1, 5, 10, 15, 30), (daily: 1), (weekly: 1), (monthly: 1).
-    /// * `start_date` - Start date.
-    /// * `end_date` - End date.
-    /// * `need_extended_hours_data` - Need extended hours data (True|False).
-    /// * `need_previous_close` - Need previous close (True|False).
-    /// Retrieves historical price data (candle history) for a given ticker symbol.
-    ///
-    /// This method allows extensive customization of the historical data, including period type,
-    /// frequency, start and end dates, and whether to include extended hours data.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - The ticker symbol for which to retrieve price history.
-    /// * `period_type` - An `Option`al `PeriodType` to specify the overall period of the data (e.g., Day, Month, Year).
-    /// * `period` - An `Option`al `u64` representing the number of periods to retrieve.
-    /// * `frequency_type` - An `Option`al `FrequencyType` to specify the granularity of the data (e.g., Minute, Daily, Weekly).
-    /// * `frequency` - An `Option`al `u64` representing the number of frequency units per candle (e.g., 1, 5, 10 minutes).
-    /// * `start_date` - An `Option`al `DateTime<Utc>` to specify the start date for the historical data.
-    /// * `end_date` - An `Option`al `DateTime<Utc>` to specify the end date for the historical data.
-    /// * `need_extended_hours_data` - An `Option`al `bool` to include extended hours trading data.
-    /// * `need_previous_close` - An `Option`al `bool` to include the previous day's closing price.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the candle history data, or an `anyhow::Error` if the request fails.
     pub async fn price_history(
         &self,
         symbol: String,
@@ -481,8 +428,8 @@ impl SchwabApi {
         end_date: Option<DateTime<Utc>>,
         need_extended_hours_data: Option<bool>,
         need_previous_close: Option<bool>,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
+    ) -> anyhow::Result<PriceHistoryResponse> {
+        let url = format!("{}/pricehistory", SCHWAB_MARKET_DATA_API_URL);
 
         let params = parse_params(vec![
             ("symbol", Some(symbol)),
@@ -502,101 +449,34 @@ impl SchwabApi {
             ),
         ]);
 
-        let request_url = format!("{}/pricehistory", SCHWAB_MARKET_DATA_API_URL);
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .query(&params)
-            .send()
-            .await?;
-
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    /// Get movers in a specific index and direction.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - Symbol ("$DJI"|"$COMPX"|"$SPX"|"NYSE"|"NASDAQ"|"OTCBB"|"INDEX_ALL"|"EQUITY_ALL"|"OPTION_ALL"|"OPTION_PUT"|"OPTION_CALL").
-    /// * `sort` - Sort ("VOLUME"|"TRADES"|"PERCENT_CHANGE_UP"|"PERCENT_CHANGE_DOWN").
-    /// * `frequency` - Frequency (0|1|5|10|30|60).
-    ///
-    /// # Notes
-    ///
-    /// Must be called within market hours (there aren't really movers outside of market hours).
-    /// Retrieves a list of top movers for a specific index and direction.
-    ///
-    /// This method provides insights into market activity by listing symbols that have
-    /// experienced significant movement based on volume, trades, or percentage change.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - The index symbol (e.g., "$DJI", "$COMPX", "$SPX") or market category (e.g., "NYSE", "NASDAQ").
-    /// * `sort` - An `Option`al `Sort` order to specify how the movers should be sorted (e.g., Volume, PercentChangeUp).
-    /// * `frequency` - An `Option`al `u64` representing the frequency of the data (e.g., 0, 1, 5, 10, 30, 60).
-    ///
-    /// # Notes
-    ///
-    /// This function is most relevant when called within market hours, as movers are typically
-    /// determined by real-time trading activity.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the movers data, or an `anyhow::Error` if the request fails.
     pub async fn movers(
         &self,
         symbol: String,
         sort: Option<Sort>,
         frequency: Option<u64>,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
-
+    ) -> anyhow::Result<MoversResponse> {
+        let url = format!("{}/movers/{}", SCHWAB_MARKET_DATA_API_URL, encode(&symbol));
         let params = parse_params(vec![
             ("sort", sort.map(|s| s.to_string())),
             ("frequency", frequency.map(|f| f.to_string())),
         ]);
 
-        let request_url = format!("{}/movers/{}", SCHWAB_MARKET_DATA_API_URL, encode(&symbol));
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .query(&params)
-            .send()
-            .await?;
-
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    /// Get Market Hours for dates in the future across different markets.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbols` - List of market symbols ("equity", "option", "bond", "future", "forex").
-    /// * `date` - Date.
-    /// Retrieves market hours for a list of specified market symbols on a given date.
-    ///
-    /// This method provides information about when various markets (e.g., equity, option, bond)
-    /// are open or closed.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbols` - A `Vec` of `MarketSymbol`s representing the markets for which to retrieve hours.
-    /// * `date` - An `Option`al `DateTime<Utc>` to specify the date for which to retrieve market hours.
-    ///            If `None`, the current date will be used.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the market hours data, or an `anyhow::Error` if the request fails.
     pub async fn market_hours(
         &self,
         symbols: Vec<MarketSymbol>,
         date: Option<DateTime<Utc>>,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
+    ) -> anyhow::Result<MarketHoursResponse> {
+        let url = format!("{}/markets", SCHWAB_MARKET_DATA_API_URL);
 
         let symbols_string = symbols
             .iter()
@@ -609,162 +489,63 @@ impl SchwabApi {
             ("date", time_to_yyyymmdd(date)),
         ]);
 
-        let request_url = format!("{}/markets", SCHWAB_MARKET_DATA_API_URL);
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .query(&params)
-            .send()
-            .await?;
-
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    /// Get Market Hours for dates in the future for a single market.
-    ///
-    /// # Arguments
-    ///
-    /// * `market_id` - Market id ("equity"|"option"|"bond"|"future"|"forex").
-    /// * `date` - Date.
-    /// Retrieves market hours for a single specified market symbol on a given date.
-    ///
-    /// This method provides detailed information about the opening and closing times for a
-    /// particular market.
-    ///
-    /// # Arguments
-    ///
-    /// * `market_id` - The `MarketSymbol` representing the specific market for which to retrieve hours.
-    /// * `date` - An `Option`al `DateTime<Utc>` to specify the date for which to retrieve market hours.
-    ///            If `None`, the current date will be used.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the market hours data, or an `anyhow::Error` if the request fails.
     pub async fn market_hour(
         &self,
         market_id: MarketSymbol,
         date: Option<DateTime<Utc>>,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
-
-        let params = parse_params(vec![("date", time_to_yyyymmdd(date))]);
-
-        let request_url = format!(
+    ) -> anyhow::Result<MarketHours> {
+        let url = format!(
             "{}/markets/{}",
             SCHWAB_MARKET_DATA_API_URL,
             market_id.to_string()
         );
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .query(&params)
-            .send()
-            .await?;
 
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let params = parse_params(vec![("date", time_to_yyyymmdd(date))]);
+
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+
+        // The API wraps the single response in a map with the market name as the key.
+        // We find the first value in the map and return it.
+        let mut response_map: MarketHoursResponse = response.json().await?;
+        let market_hours = response_map
+            .into_values()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Market hours response was empty"))?;
+        Ok(market_hours)
     }
 
-    /// Get instruments for a list of symbols.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - Symbol.
-    /// * `projection` - Projection ("symbol-search"|"symbol-regex"|"desc-search"|"desc-regex"|"search"|"fundamental").
-    /// Searches for instruments based on a symbol and projection type.
-    ///
-    /// This method allows finding instruments by symbol, description, or using regular expressions,
-    /// and can return fundamental data.
-    ///
-    /// # Arguments
-    ///
-    /// * `symbol` - The symbol or description to search for.
-    /// * `projection` - The `Projection` type to specify the search method and data to return.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the instrument data, or an `anyhow::Error` if the request fails.
     pub async fn instruments(
         &self,
         symbol: String,
         projection: Projection,
-    ) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
+    ) -> anyhow::Result<InstrumentsResponse> {
+        let url = format!("{}/instruments", SCHWAB_MARKET_DATA_API_URL);
 
         let params = parse_params(vec![
             ("symbol", Some(symbol)),
             ("projection", Some(projection.to_string())),
         ]);
 
-        let request_url = format!("{}/instruments", SCHWAB_MARKET_DATA_API_URL);
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .query(&params)
-            .send()
-            .await?;
-
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
+        let builder = self.reqwest_client.get(url).query(&params);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 
-    /// Get instrument for a single cusip.
-    ///
-    /// # Arguments
-    ///
-    /// * `cusip_id` - Cusip id.
-    /// Retrieves instrument details for a single CUSIP ID.
-    ///
-    /// This method provides specific information about an instrument identified by its CUSIP.
-    ///
-    /// # Arguments
-    ///
-    /// * `cusip_id` - The CUSIP ID of the instrument to retrieve.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `serde_json::Value` with the instrument data, or an `anyhow::Error` if the request fails.
-    pub async fn instrument_cusip(&self, cusip_id: String) -> anyhow::Result<Value, anyhow::Error> {
-        let headers = self.construct_request_headers().await?;
-
-        let request_url = format!(
+    pub async fn instrument_cusip(&self, cusip_id: String) -> anyhow::Result<InstrumentsResponse> {
+        let url = format!(
             "{}/instruments/{}",
             SCHWAB_MARKET_DATA_API_URL,
             encode(&cusip_id)
         );
-        let response = self
-            .reqwest_client
-            .get(request_url)
-            .headers(headers)
-            .send()
-            .await?;
 
-        let response_json = serde_json::from_str(response.text().await?.as_str())?;
-        Ok(response_json)
-    }
-
-    /// Constructs the request headers for a Schwab API request.
-    ///
-    /// # Returns
-    ///
-    /// A `HeaderMap` containing the required headers for a Schwab API request.
-    async fn construct_request_headers(&self) -> anyhow::Result<HeaderMap, anyhow::Error> {
-        let mut headers = HeaderMap::new();
-
-        let json_string = tokio::fs::read_to_string(&self.tokens_file_path).await?;
-        let data: StoredTokenInfo = serde_json::from_str(&json_string)?;
-        let auth_header = format!("Bearer {}", data.access_token.as_str());
-
-        headers.append("Accept", HeaderValue::from_str("application/json")?);
-        headers.append(
-            "Authorization",
-            HeaderValue::from_str(auth_header.as_str())?,
-        );
-
-        Ok(headers)
+        let builder = self.reqwest_client.get(url);
+        let response = self.send_request(builder).await?;
+        response.json().await.map_err(Into::into)
     }
 }

@@ -5,45 +5,59 @@ use std::{
 };
 
 use brokerage_api::{
-    SchwabApi, SchwabAuth, SchwabStreamer,
-    schwab::schwab_streamer::{Command, Service, StreamRequest},
+    schwab::{models::streamer::StreamerMessage, schwab_streamer::{self, Command, Service, StreamRequest}}, SchwabApi, SchwabAuth, SchwabStreamer
 };
 use chrono::Utc;
 use reqwest::Client;
 use tokio::sync::Mutex;
+use tracing::{info, Level};
+use tracing_subscriber::fmt::init;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), anyhow::Error> {
-    let app_key = std::env::var("SCHWAB_APP_KEY")?;
-    let app_secret = std::env::var("SCHWAB_APP_SECRET")?;
+    tracing_subscriber::fmt::init();
+    let mut streamer = SchwabStreamer::default().await?;
+    
+    // Start the streamer and get the receiver for messages
+    let mut receiver = streamer.start().await?;
+    
+    // Wait for the streamer to log in and become active
+    while !streamer.is_active().await {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    
+    println!("Streamer is active. Subscribing to SPY quotes.");
 
-    let schwab_auth = SchwabAuth::default();
+    // Build and send a subscription request
+    let equity_request = streamer.level_one_equities(
+        vec!["SPY".to_string()], 
+        vec![], // Empty vec for all fields
+        schwab_streamer::Command::Subs,
+    )?;
+    streamer.send_requests(vec![equity_request]).await?;
 
-    // schwab_auth.authorize(&app_key, &app_secret).await?;
-    schwab_auth.refresh_tokens(&app_key, &app_secret).await?;
+    println!("Subscription sent. Waiting for messages...");
 
-    let mut streamer_api = SchwabStreamer::default().await?;
-    // TODO: send_requests should queue up the requests using record_request method, and there should be an async handler that runs periodically
-    // to send all queued up requests. This way the client doesn't have to do the management of knowing when streamer is_active vs not, to decide
-    // if it's safe to send a request.
-    let mut request_sent = false;
-    while request_sent == false {
-        if !streamer_api.is_active() {
-            continue;
-        }
-        println!("[{:?}] Login succeeded", Utc::now());
-        // println!("[{:?}] Sleeping for 15 seconds", Utc::now());
-        // sleep(Duration::from_secs(15));
-        if request_sent == false {
-            println!("[{:?}] Sending SUBS request", Utc::now());
-            let stream_requests = vec![streamer_api.level_one_equities(
-                vec!["NVDA".to_owned()],
-                vec![],
-                Command::Subs,
-            )?];
-            streamer_api.send_requests(stream_requests).await?;
-            request_sent = true;
+    // Listen for incoming messages on the channel
+    while let Some(message) = receiver.recv().await {
+        match message {
+            StreamerMessage::LevelOneEquity(equity_quote) => {
+                println!(
+                    "Received Equity Quote for {}: Bid: {:?}, Ask: {:?}",
+                    equity_quote.symbol,
+                    equity_quote.bid_price,
+                    equity_quote.ask_price
+                );
+            }
+            StreamerMessage::LevelOneOption(option_quote) => {
+                println!(
+                    "Received Option Quote for {}: Mark Price: {:?}",
+                    option_quote.symbol,
+                    option_quote.mark_price
+                );
+            }
         }
     }
+
     loop {}
 }
