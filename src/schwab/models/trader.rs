@@ -1,5 +1,3 @@
-// src/schwab/models/trader.rs
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

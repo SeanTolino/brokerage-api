@@ -1,5 +1,3 @@
-// src/schwab/schwab_auth.rs
-
 use std::{
     fs,
     io::{self, Write},

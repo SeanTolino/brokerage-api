@@ -1,5 +1,3 @@
-// src/schwab/schwab_api.rs
-
 use std::{env, fmt, sync::Arc};
 
 use chrono::{DateTime, Utc};
@@ -315,8 +313,6 @@ impl SchwabApi {
         Ok(headers)
     }
 
-    // --- API Methods ---
-
     pub async fn get_preferences(&self) -> anyhow::Result<UserPreferencesResponse> {
         let builder = self
             .reqwest_client
@@ -547,5 +543,9 @@ impl SchwabApi {
         let builder = self.reqwest_client.get(url);
         let response = self.send_request(builder).await?;
         response.json().await.map_err(Into::into)
+    }
+
+    pub(crate) async fn token_info(&self) -> StoredTokenInfo {
+        self.token_info.lock().await.clone()
     }
 }

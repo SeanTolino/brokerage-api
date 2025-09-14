@@ -1,47 +1,39 @@
-// src/schwab/schwab_streamer.rs
-
 use std::{
     collections::HashMap,
-    default, env, fmt, fs,
+    fmt,
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
-    time::Instant,
 };
 
 use anyhow::anyhow;
 use chrono::Utc;
-use futures_util::{
-    stream::{SplitSink, SplitStream},
-    SinkExt, StreamExt,
-};
-use serde_json::{json, Value};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use serde_json::{Value, json};
 use tokio::{
     net::TcpStream,
-    sync::{mpsc, Mutex}, // <-- Added mpsc
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use tracing::{info, warn};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tracing::{debug, warn};
 
 use crate::{
+    SchwabApi,
     schwab::{
-        common::{SCHWAB_STREAMER_API_URL, TOKENS_FILE},
+        common::SCHWAB_STREAMER_API_URL,
         models::{
             streamer::{
                 self, LevelOneEquitiesResponse, LevelOneOptionsField, LevelOneOptionsResponse,
-                StreamerMessage, // <-- IMPORT THE NEW ENUM
+                StreamerMessage,
             },
             trader::UserPreferencesResponse,
         },
-        schwab_auth::StoredTokenInfo,
     },
-    SchwabApi,
 };
 
-// ... (enums for Command and Service are unchanged) ...
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     Add,
     Subs,
@@ -86,7 +78,7 @@ impl From<String> for Command {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub enum Service {
     LevelOneOptions,
     LevelOneEquities,
@@ -116,11 +108,12 @@ impl fmt::Display for Service {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct StreamRequest {
-    service: Service,
-    command: Command,
-    keys: Vec<String>,
-    fields: Vec<String>,
+    pub service: Service,
+    pub command: Command,
+    pub keys: Vec<String>,
+    pub fields: Vec<String>,
 }
 
 impl StreamRequest {
@@ -143,60 +136,34 @@ struct SchwabStreamerInner {
     is_active: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
-pub struct SchwabStreamer {
-    inner: Arc<Mutex<SchwabStreamerInner>>,
-    request_id: Arc<AtomicI64>,
-    streamer_info: Arc<Value>,
-}
-
 impl SchwabStreamerInner {
-    #[tracing::instrument]
-    async fn connect(
-        &mut self,
-        streamer_info: Arc<Value>,
-        request_id: Arc<AtomicI64>,
-    ) -> anyhow::Result<SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>, anyhow::Error>
-    {
-        let schwab_client_channel = streamer_info
-            .get("schwabClientChannel")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("Unable to read schwabClientChannel from streamer info"))?;
-        let schwab_client_function_id = streamer_info
-            .get("schwabClientFunctionId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("Unable to read schwabClientFunctionId from streamer info"))?;
+    fn record_request(&mut self, stream_request: &StreamRequest) {
+        let service_map = self
+            .subscriptions
+            .entry(stream_request.service.clone())
+            .or_default();
 
-        let json_string = fs::read_to_string(TOKENS_FILE)?;
-        let data: StoredTokenInfo = serde_json::from_str(&json_string)?;
-        let auth_header = data.access_token.as_str();
-
-        let (ws_stream, _response) = connect_async(SCHWAB_STREAMER_API_URL)
-            .await
-            .expect("Failed to connect to stream API");
-
-        let (mut write, read) = ws_stream.split();
-        let parameters = json!({
-            "Authorization": auth_header,
-            "SchwabClientChannel": schwab_client_channel,
-            "SchwabClientFunctionId": schwab_client_function_id,
-        });
-        let message = build_message(
-            request_id,
-            streamer_info,
-            Service::Admin,
-            Command::Login,
-            parameters,
-        )?;
-        info!("[{:?}] Sending LOGIN request", Utc::now());
-        info!("{:?}", message);
-        write
-            .send(Message::Text(message.to_string().into()))
-            .await?;
-
-        self.writer = Some(write);
-
-        Ok(read)
+        match stream_request.command {
+            Command::Add => {
+                for key in &stream_request.keys {
+                    let key_fields = service_map.entry(key.clone()).or_default();
+                    key_fields.extend(stream_request.fields.clone());
+                    key_fields.sort();
+                    key_fields.dedup();
+                }
+            }
+            Command::Subs => {
+                for key in &stream_request.keys {
+                    service_map.insert(key.clone(), stream_request.fields.clone());
+                }
+            }
+            Command::Unsubs => {
+                for key in &stream_request.keys {
+                    service_map.remove(key);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_command_response(&mut self, value: &Value) {
@@ -208,39 +175,38 @@ impl SchwabStreamerInner {
             .unwrap_or_default();
 
         match command {
-            Command::Add => {
-                info!("Received add command response: {:?}", value);
-            }
-            Command::Subs => {
-                info!("Received subs command response: {:?}", value);
-            }
-            Command::Unsubs => {
-                info!("Received unsubs command response: {:?}", value);
+            Command::Add | Command::Subs | Command::Unsubs => {
+                debug!("Received subscription response: {:?}", value);
             }
             Command::View => {
-                info!("View command not supported");
+                debug!("View command not supported");
             }
             Command::Login => {
-                info!("Received login command response: {:?}", value);
+                debug!("Received login response: {:?}", value);
                 if let Some(code) = value
                     .get("content")
-                    .and_then(|content| content.get("code"))
-                    .and_then(Value::as_u64)
+                    .and_then(|content| content.get("code").and_then(Value::as_u64))
                 {
                     if code == 0 {
-                        self.is_active
-                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.is_active.store(true, Ordering::SeqCst);
                     }
                 }
             }
             Command::Logout => {
-                info!("Received logout command response: {:?}", value);
+                debug!("Received logout response: {:?}", value);
             }
             Command::Unknown => {
-                info!("Received unknown command response: {:?}", value);
+                debug!("Received unknown command response: {:?}", value);
             }
         }
     }
+}
+
+#[derive(Clone)]
+pub struct SchwabStreamer {
+    inner: Arc<Mutex<SchwabStreamerInner>>,
+    request_id: Arc<AtomicI64>,
+    streamer_info: Arc<Value>,
 }
 
 impl SchwabStreamer {
@@ -250,7 +216,7 @@ impl SchwabStreamer {
         let streamer_info = user_preferences
             .streamer_info
             .get(0)
-            .ok_or_else(|| anyhow::anyhow!("Streamer info not found in user preferences"))?;
+            .ok_or_else(|| anyhow!("Streamer info not found in user preferences"))?;
 
         let streamer_info_value = serde_json::to_value(streamer_info)?;
 
@@ -274,72 +240,128 @@ impl SchwabStreamer {
         SchwabStreamer::new(schwab_api).await
     }
 
-    /// Starts the WebSocket listener and returns a channel receiver to get incoming data.
-    ///
-    /// # Returns
-    ///
-    /// A `tokio::sync::mpsc::Receiver` that will receive `StreamerMessage` enums.
     pub async fn start(&self) -> anyhow::Result<mpsc::Receiver<StreamerMessage>> {
         let inner_clone = self.inner.clone();
-        
-        // Create a channel for sending data out to the user.
+
         let (tx, rx) = mpsc::channel(100);
 
         let mut read = {
             let mut guard = self.inner.lock().await;
-            guard
-                .connect(self.streamer_info.clone(), self.request_id.clone())
-                .await?
+
+            let token_info = guard.schwab_api.token_info().await;
+            let auth_header = token_info.access_token.as_str();
+
+            let (ws_stream, _response) = connect_async(SCHWAB_STREAMER_API_URL)
+                .await
+                .expect("Failed to connect to stream API");
+
+            let (mut write, read) = ws_stream.split();
+
+            let parameters = json!({
+                "qoslevel": "0",
+                "Authorization": auth_header,
+                "SchwabClientChannel": self.streamer_info.get("schwabClientChannel"),
+                "SchwabClientFunctionId": self.streamer_info.get("schwabClientFunctionId"),
+            });
+
+            let message = build_message(
+                self.request_id.clone(),
+                self.streamer_info.clone(),
+                Service::Admin,
+                Command::Login,
+                parameters,
+            )?;
+
+            debug!("[{:?}] Sending LOGIN request", Utc::now());
+            write
+                .send(Message::Text(message.to_string().into()))
+                .await?;
+
+            guard.writer = Some(write);
+            read
         };
 
         let listener = tokio::spawn(async move {
             while let Some(message_result) = read.next().await {
+                debug!("READER RECEIVED: {:?}", message_result);
                 match message_result {
                     Ok(msg) => {
                         if let Ok(text) = msg.into_text() {
                             if let Ok(json_data) = serde_json::from_str::<Value>(&text) {
-                                // Handle command responses
-                                if let Some(responses) = json_data.get("response").and_then(Value::as_array) {
+                                if let Some(responses) =
+                                    json_data.get("response").and_then(Value::as_array)
+                                {
                                     let mut guard = inner_clone.lock().await;
                                     for r in responses {
                                         guard.handle_command_response(r);
+                                        // if let Some(content) = r.get("content") {
+                                        //     guard.handle_command_response(content);
+                                        // }
                                     }
                                 }
-                                
-                                // Handle data payloads and send them to the channel
-                                if let Some(data_array) = json_data.get("data").and_then(Value::as_array) {
+
+                                if let Some(data_array) =
+                                    json_data.get("data").and_then(Value::as_array)
+                                {
                                     for d in data_array {
-                                        let service_str = d.get("service").and_then(Value::as_str).unwrap_or("");
+                                        let service_str =
+                                            d.get("service").and_then(Value::as_str).unwrap_or("");
                                         let service = Service::from(service_str.to_string());
-                                        
-                                        if let Some(content) = d.get("content").and_then(Value::as_array) {
+
+                                        if let Some(content) =
+                                            d.get("content").and_then(Value::as_array)
+                                        {
                                             for item in content {
                                                 let message = match service {
                                                     Service::LevelOneEquities => {
-                                                        match serde_json::from_value::<LevelOneEquitiesResponse>(item.clone()) {
-                                                            Ok(equity_data) => Some(StreamerMessage::LevelOneEquity(equity_data)),
+                                                        match serde_json::from_value::<
+                                                            LevelOneEquitiesResponse,
+                                                        >(
+                                                            item.clone()
+                                                        ) {
+                                                            Ok(equity_data) => Some(
+                                                                StreamerMessage::LevelOneEquity(
+                                                                    equity_data,
+                                                                ),
+                                                            ),
                                                             Err(e) => {
-                                                                warn!("Failed to deserialize LevelOneEquitiesResponse: {}", e);
+                                                                warn!(
+                                                                    "Failed to deserialize LevelOneEquitiesResponse: {}",
+                                                                    e
+                                                                );
                                                                 None
                                                             }
                                                         }
-                                                    },
+                                                    }
                                                     Service::LevelOneOptions => {
-                                                        match serde_json::from_value::<LevelOneOptionsResponse>(item.clone()) {
-                                                            Ok(option_data) => Some(StreamerMessage::LevelOneOption(option_data)),
+                                                        match serde_json::from_value::<
+                                                            LevelOneOptionsResponse,
+                                                        >(
+                                                            item.clone()
+                                                        ) {
+                                                            Ok(option_data) => Some(
+                                                                StreamerMessage::LevelOneOption(
+                                                                    option_data,
+                                                                ),
+                                                            ),
                                                             Err(e) => {
-                                                                warn!("Failed to deserialize LevelOneOptionsResponse: {}", e);
+                                                                warn!(
+                                                                    "Failed to deserialize LevelOneOptionsResponse: {}",
+                                                                    e
+                                                                );
                                                                 None
                                                             }
                                                         }
-                                                    },
+                                                    }
                                                     _ => None,
                                                 };
 
                                                 if let Some(msg) = message {
                                                     if tx.send(msg).await.is_err() {
-                                                        info!("Stream receiver dropped. Closing listener task.");
-                                                        return; // Exit task if the receiver is gone
+                                                        debug!(
+                                                            "Stream receiver dropped. Closing listener task."
+                                                        );
+                                                        return;
                                                     }
                                                 }
                                             }
@@ -348,7 +370,7 @@ impl SchwabStreamer {
                                 }
                             }
                         }
-                    },
+                    }
                     Err(e) => {
                         warn!("Error reading from WebSocket stream: {}", e);
                         break;
@@ -358,14 +380,69 @@ impl SchwabStreamer {
         });
 
         self.inner.lock().await.listener_handle = Some(Arc::new(listener));
-
         Ok(rx)
     }
-    
-    // ... rest of the file is the same
-    pub async fn get_listener(&self) -> Option<Arc<JoinHandle<()>>> {
-        let guard = self.inner.lock().await;
-        guard.listener_handle.as_ref().map(Arc::clone)
+
+    pub async fn send(&self, requests: Vec<StreamRequest>) -> anyhow::Result<()> {
+        let mut guard = self.inner.lock().await;
+        if let Some(mut writer) = guard.writer.take() {
+            for request in requests {
+                guard.record_request(&request);
+
+                let parameters = json!({
+                    "keys": request.keys.join(","),
+                    "fields": request.fields.join(","),
+                });
+
+                let message = build_message(
+                    self.request_id.clone(),
+                    self.streamer_info.clone(),
+                    request.service,
+                    request.command,
+                    parameters,
+                )?;
+
+                debug!("Sending request: {:?}", message);
+                writer
+                    .send(Message::Text(message.to_string().into()))
+                    .await?;
+            }
+            // Put the writer back after the loop
+            guard.writer = Some(writer);
+        } else {
+            return Err(anyhow!("Streamer is not connected. Call start() first."));
+        }
+        Ok(())
+    }
+
+    pub fn level_one_equities(
+        &self,
+        keys: Vec<String>,
+        fields: Vec<streamer::LevelOneEquitiesField>,
+        command: Command,
+    ) -> StreamRequest {
+        let fields_as_strings: Vec<String> = if fields.is_empty() {
+            (0..=51).map(|f| f.to_string()).collect()
+        } else {
+            fields.iter().map(|f| f.to_string()).collect()
+        };
+
+        StreamRequest::new(Service::LevelOneEquities, command, keys, fields_as_strings)
+    }
+
+    pub fn level_one_options(
+        &self,
+        keys: Vec<String>,
+        fields: Vec<LevelOneOptionsField>,
+        command: Command,
+    ) -> StreamRequest {
+        let fields_as_strings: Vec<String> = if fields.is_empty() {
+            (0..=55).map(|v| v.to_string()).collect()
+        } else {
+            fields.iter().map(|f| f.to_string()).collect()
+        };
+
+        StreamRequest::new(Service::LevelOneOptions, command, keys, fields_as_strings)
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {
@@ -379,135 +456,9 @@ impl SchwabStreamer {
         Ok(())
     }
 
-    pub async fn send_requests(
-        &self,
-        stream_requests: Vec<Value>,
-    ) -> anyhow::Result<()> {
-        let mut guard = self.inner.lock().await;
-        if let Some(writer) = guard.writer.as_mut() {
-            for request in stream_requests {
-                info!("Sending request: {:?}", request);
-                writer
-                    .send(Message::Text(request.to_string().into()))
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn level_one_equities(
-        &mut self,
-        keys: Vec<String>,
-        fields: Vec<streamer::LevelOneEquitiesField>,
-        command: Command,
-    ) -> anyhow::Result<Value> {
-        let fields: String = if fields.len() > 0 {
-            fields
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<String>>()
-                .join(",")
-        } else {
-            (0..=51)
-                .map(|f| f.to_string())
-                .collect::<Vec<String>>()
-                .join(",")
-        };
-        let parameters = json!({
-            "keys": keys.join(","),
-            "fields": fields,
-        });
-        Ok(build_message(
-            self.request_id.clone(),
-            self.streamer_info.clone(),
-            Service::LevelOneEquities,
-            command,
-            parameters,
-        )?)
-    }
-
-    pub fn level_one_options(
-        &mut self,
-        keys: Vec<String>,
-        fields: Vec<LevelOneOptionsField>,
-        command: Command,
-    ) -> anyhow::Result<Value> {
-        let fields: String = if fields.len() > 0 {
-            fields
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<String>>()
-                .join(",")
-        } else {
-            (0..=55)
-                .map(|v| v.to_string())
-                .collect::<Vec<String>>()
-                .join(",")
-        };
-        let parameters = json!({
-            "keys": keys.join(","),
-            "fields": fields,
-        });
-        Ok(build_message(
-            self.request_id.clone(),
-            self.streamer_info.clone(),
-            Service::LevelOneOptions,
-            command,
-            parameters,
-        )?)
-    }
-
     pub async fn is_active(&self) -> bool {
         let inner = self.inner.lock().await;
-        inner.is_active.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    async fn record_request(&mut self, stream_request: StreamRequest) {
-        let mut guard = self.inner.lock().await;
-        let service = stream_request.service;
-        let command = stream_request.command;
-        let keys = stream_request.keys;
-        let fields = stream_request.fields;
-
-        match command {
-            Command::Add => {
-                let service = guard.subscriptions.get_mut(&service);
-                if let Some(s) = service {
-                    for key in keys {
-                        match s.get_mut(&key) {
-                            Some(v) => {
-                                v.extend(fields.clone());
-                            }
-                            None => {
-                                s.insert(key, fields.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            Command::Subs => {
-                let service = guard.subscriptions.get_mut(&service);
-                if let Some(s) = service {
-                    for key in keys {
-                        s.insert(key, fields.clone());
-                    }
-                }
-            }
-            Command::Unsubs => {
-                let service = guard.subscriptions.get_mut(&service);
-                if let Some(s) = service {
-                    for key in keys {
-                        s.remove(&key);
-                    }
-                }
-            }
-            Command::View => {
-                panic!("VIEW command not implemented");
-            }
-            _ => {
-                panic!("{}", format!("{} is an unsupported command", command));
-            }
-        }
+        inner.is_active.load(Ordering::SeqCst)
     }
 }
 
@@ -518,22 +469,23 @@ fn build_message(
     command: Command,
     parameters: Value,
 ) -> anyhow::Result<Value> {
-    let request_id = request_id.fetch_add(1, Ordering::Relaxed);
+    let request_id_num = request_id.fetch_add(1, Ordering::Relaxed);
     let schwab_client_customer_id = streamer_info
         .get("schwabClientCustomerId")
-        .ok_or_else(|| anyhow!("Unable to read streamer info"))?;
-    let schwab_client_correlation_id = streamer_info
+        .ok_or_else(|| anyhow!("Unable to read schwabClientCustomerId from streamer info"))?;
+    let schwab_client_correl_id = streamer_info
         .get("schwabClientCorrelId")
-        .ok_or_else(|| anyhow!("Unable to read streamer info"))?;
-    Ok(json!({
-        "service": service.to_string(),
-        "command": command.to_string(),
-        "requestid": request_id + 1,
-        "parameters": parameters,
-        "SchwabClientCustomerId": schwab_client_customer_id,
-        "SchwabClientCorrelId": schwab_client_correlation_id,
-    }))
-}
+        .ok_or_else(|| anyhow!("Unable to read schwabClientCorrelId from streamer info"))?;
 
-#[cfg(test)]
-mod test {}
+    let message = json!({
+        "requests": [{
+            "service": service.to_string(),
+            "command": command.to_string(),
+            "requestid": request_id_num,
+            "parameters": parameters,
+            "SchwabClientCustomerId": schwab_client_customer_id,
+            "SchwabClientCorrelId": schwab_client_correl_id,
+        }]
+    });
+    Ok(message)
+}
