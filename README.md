@@ -1,169 +1,204 @@
-# brokerage-api
+# Brokerage-API
 
-A Rust library for integrating with various brokerage APIs, starting with a comprehensive implementation for Schwab. This library aims to provide a robust and easy-to-use interface for accessing market data, managing authentication, and eventually supporting trading operations.
+[![Crates.io](https://img.shields.io/crates/v/brokerage-api.svg)](https://crates.io/crates/brokerage-api)
+[![Docs.rs](https://docs.rs/brokerage-api/badge.svg)](https://docs.rs/brokerage-api)
+[![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](https://github.com/SeanTolino/brokerage-api)
 
-## Current Status
+An unofficial, asynchronous Rust client for the Charles Schwab brokerage API, designed for both stock and options data.
 
-This library is currently **under development**. The primary focus is on the Schwab Market Data Production API, which is partially implemented. Contributions are welcome!
+This library provides strongly-typed models for API responses and a robust client that handles authentication, token refreshing, and real-time data streaming, all built on the `tokio` asynchronous runtime.
 
-## Features
+## ✨ Features
 
-*   **Schwab API Integration**:
-    *   Authentication and token management (OAuth 2.0).
-    *   Market data access:
-        *   Real-time quotes for symbols.
-        *   Options chain retrieval.
-        *   Historical price data.
-        *   Market movers.
-        *   Market hours information.
-        *   Instrument search by symbol, description, and CUSIP.
+* **Asynchronous:** Built with `async/.await` and `tokio` for high performance.
+* **Strongly-Typed:** Clean, and easy-to-use data models for all API responses. No manual JSON parsing required.
+* **Automatic Token Refresh:** The client transparently handles OAuth 2.0 token expiration and refreshing, so you don't have to.
+* **Real-Time Data Streaming:** 📈 A WebSocket streamer provides live market data through a simple channel-based interface.
+* **State Management:** The streamer tracks its own subscriptions, paving the way for automatic resubscription on reconnect.
 
-## Installation
+---
 
-Add the following to your `Cargo.toml` file:
+## ⚠️ Disclaimer & Current Status
 
+This is an **unofficial** library and is not affiliated with, endorsed, or supported by Charles Schwab in any way. Use it at your own risk.
+
+This library is currently under active development. The following components are implemented:
+* **Authentication:** Full OAuth 2.0 flow for generating and refreshing tokens.
+* **Market Data API:** All endpoints are implemented with strongly-typed responses.
+* **Real-Time Streamer:** Level 1 Equity and Option quotes are supported.
+
+The **Trading API** (placing, modifying, and canceling orders) is not yet implemented.
+
+---
+
+## 🚀 Getting Started
+
+Add the library to your `Cargo.toml`:
 ```toml
 [dependencies]
-brokerage-api = "0.1.5" # Or the latest version
-tokio = { version = "1", features = ["full"] } # Required for async operations
-reqwest = { version = "0.11", features = ["json"] } # For HTTP requests
-anyhow = "1.0" # For error handling
+schwab_api_rs = "0.2.0"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1.0"
+dotenv = "0.15"
 ```
 
-## Usage
+## Setup & Authentication
 
-### Schwab API Authentication
+Before you can use the API, you need your App Key (Client ID) and App Secret from your Schwab Developer Portal application.
 
-To use the Schwab API, you must first authorize the application to obtain access and refresh tokens. These tokens are stored locally in a `tokens.json` file.
+1. Set Environment Variables: Create a .env file in your project's root directory:
 
-```rust
-use std::sync::Arc;
-use brokerage_api::SchwabAuth;
+```
+SCHWAB_APP_KEY="YOUR_APP_KEY_HERE"
+SCHWAB_APP_SECRET="YOUR_APP_SECRET_HERE"
+```
+
+2. Run the One-Time Authorization: The first time you use the library, you need to authorize it with your Schwab account. Create a new binary file (e.g., src/bin/auth.rs) and run it.
+
+```
+// src/bin/auth.rs
+use schwab_api_rs::SchwabAuth;
+use dotenv::dotenv;
+use std::env;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = Arc::new(reqwest::Client::new());
-    let schwab_auth = SchwabAuth::new(client, "tokens.json".to_string());
+    dotenv().ok(); // Load .env file
 
-    let app_key = std::env::var("SCHWAB_APP_KEY")
-        .expect("SCHWAB_APP_KEY environment variable not set");
-    let app_secret = std::env::var("SCHWAB_APP_SECRET")
-        .expect("SCHWAB_APP_SECRET environment variable not set");
+    let app_key = env::var("SCHWAB_APP_KEY")?;
+    let app_secret = env::var("SCHWAB_APP_SECRET")?;
 
-    // Authorize the application (first-time setup)
-    schwab_auth.authorize(&app_key, &app_secret).await?;
+    let auth = SchwabAuth::default();
+    auth.authorize(&app_key, &app_secret).await?;
 
-    // To refresh tokens (after initial authorization)
-    // schwab_auth.refresh_tokens(&app_key, &app_secret).await?;
-
-    println!("Schwab API authorization successful!");
+    println!("Successfully created tokens.json!");
 
     Ok(())
 }
 ```
 
-**Authorization Steps:**
+Run this with cargo run --bin auth. It will print a URL. Paste it into your browser, log in, grant access, and then paste the final URL from your browser's address bar back into the terminal. This will create a tokens.json file that the library will use from now on.
 
-1.  Run the `authorize` function.
-2.  The application will print an authorization URL to your console. Copy this URL and paste it into your web browser.
-3.  Log in with your Schwab portfolio credentials and grant authorization to the application.
-4.  You will be redirected to a blank page (e.g., `https://127.0.0.1`). Copy the **FULL URL** from your browser's address bar.
-5.  Paste this URL back into your terminal when prompted and press Enter.
-6.  The application will exchange the authorization code for access and refresh tokens, saving them to `tokens.json`.
 
-### Schwab API Market Data Usage
+--------------------------------
+## Usage Examples
 
-Once authorized, you can use the `SchwabApi` client to access various market data endpoints.
+### REST API Client Example
 
-#### Get Quotes for Multiple Symbols
-
-```rust
-use std::sync::Arc;
-use brokerage_api::{SchwabApi, QuoteFields};
+Here's how to create a client and fetch quotes for a few stocks. The client will automatically refresh your token if it has expired.
+```
+use schwab_api_rs::SchwabApi;
+use dotenv::dotenv;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = Arc::new(reqwest::Client::new());
-    let schwab_api = SchwabApi::new(client, "tokens.json".to_string());
+    dotenv().ok(); // Load .env file
 
-    let symbols = vec!["AAPL".to_string(), "GOOG".to_string()];
-    let fields = Some(vec![QuoteFields::Quote, QuoteFields::Fundamental]);
-    let indicative = Some(false);
+    // Create a new API client using credentials from environment variables
+    let api = SchwabApi::default().await?;
 
-    let quotes = schwab_api.get_quotes(symbols, fields, indicative).await?;
-    println!("Quotes: {}", serde_json::to_string_pretty(&quotes)?);
+    let symbols = vec!["AAPL".to_string(), "TSLA".to_string()];
+
+    println!("Fetching quotes for {:?}", symbols);
+    let quotes = api.get_quotes(symbols, None, None).await?;
+
+    for (symbol, quote_data) in quotes {
+        if let Some(quote) = quote_data.quote {
+            println!(
+                "  - {}: Last Price: ${:.2}, Volume: {}",
+                symbol, quote.last_price, quote.total_volume
+            );
+        }
+    }
 
     Ok(())
 }
 ```
 
-#### Get Options Chains
+### WebSocket Streamer Example
 
-```rust
-use std::sync::Arc;
-use brokerage_api::{SchwabApi, ContractType};
+The streamer provides real-time data. You start() it to get a channel receiver, then send() subscription requests.
+```
+use schwab_api_rs::{
+    schwab_streamer::{Command, SchwabStreamer},
+    models::streamer::StreamerMessage,
+};
+use dotenv::dotenv;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = Arc::new(reqwest::Client::new());
-    let schwab_api = SchwabApi::new(client, "tokens.json".to_string());
+    dotenv().ok(); // Load .env file
 
-    let symbol = "SPY".to_string();
-    let contract_type = ContractType::All;
-    let strike_count = 5;
-    let include_underlying_quote = true;
+    // Create the streamer. It uses the same SchwabApi client internally.
+    let streamer = SchwabStreamer::default().await?;
+    
+    // Start the listener task and get the receiver for messages
+    let mut receiver = streamer.start().await?;
+    
+    // Wait for the streamer to log in and become active
+    while !streamer.is_active().await {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+    println!("Streamer is active. Subscribing to SPY quotes...");
 
-    let chains = schwab_api.get_chains(symbol, contract_type, strike_count, include_underlying_quote).await?;
-    println!("Option Chains: {}", serde_json::to_string_pretty(&chains)?);
+    // 1. Build a typed subscription request
+    let equity_request = streamer.level_one_equities(
+        vec!["SPY".to_string()], 
+        vec![], // Empty vec subscribes to all available fields
+        Command::Subs,
+    );
+
+    // 2. Send the request
+    streamer.send(vec![equity_request]).await?;
+
+    println!("Subscription sent. Waiting for messages...");
+
+    // 3. Listen for incoming messages on the channel
+    while let Some(message) = receiver.recv().await {
+        match message {
+            StreamerMessage::LevelOneEquity(equity_quote) => {
+                println!(
+                    "EQUITY -> {}: Bid: {:?}, Ask: {:?}",
+                    equity_quote.symbol,
+                    equity_quote.bid_price,
+                    equity_quote.ask_price
+                );
+            }
+            StreamerMessage::LevelOneOption(option_quote) => {
+                println!(
+                    "OPTION -> {}: Mark Price: {:?}",
+                    option_quote.symbol,
+                    option_quote.mark_price
+                );
+            }
+        }
+    }
 
     Ok(())
 }
 ```
 
-#### Get Price History
+## Roadmap
 
-```rust
-use std::sync::Arc;
-use chrono::{Utc, Duration};
-use brokerage_api::{SchwabApi, PeriodType, FrequencyType};
+* [ ] Implement a custom, specific Error type.
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let client = Arc::new(reqwest::Client::new());
-    let schwab_api = SchwabApi::new(client, "tokens.json".to_string());
+* [ ] Implement Trading API endpoints (orders, accounts).
 
-    let symbol = "MSFT".to_string();
-    let period_type = Some(PeriodType::Month);
-    let period = Some(1); // 1 month
-    let frequency_type = Some(FrequencyType::Daily);
-    let frequency = Some(1); // Daily frequency
-    let end_date = Some(Utc::now());
-    let start_date = Some(Utc::now() - Duration::days(30)); // Last 30 days
+* [ ] Add automatic resubscription on streamer reconnect.
 
-    let history = schwab_api.price_history(
-        symbol,
-        period_type,
-        period,
-        frequency_type,
-        frequency,
-        start_date,
-        end_date,
-        Some(false), // No extended hours data
-        Some(true),  // Need previous close
-    ).await?;
-    println!("Price History: {}", serde_json::to_string_pretty(&history)?);
+* [ ] Add more examples and documentation.
 
-    Ok(())
-}
-```
 
 ## Contributing
 
-We welcome contributions to this library! If you're interested in:
+Contributions are welcome! Feel free to open an issue or submit a pull request.
 
-*   Implementing more Schwab API endpoints.
-*   Adding support for other brokerage APIs.
-*   Improving existing features or documentation.
-*   Fixing bugs.
+## License
 
-Please feel free to open an issue or submit a pull request.
+This project is licensed under either of:
+
+    Apache License, Version 2.0, (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+
+    MIT license (LICENSE-MIT or http://opensource.org/licenses/MIT)
+
+at your option.
