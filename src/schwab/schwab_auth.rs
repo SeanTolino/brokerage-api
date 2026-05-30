@@ -7,7 +7,7 @@ use std::{
 use base64::{engine::general_purpose, Engine};
 use reqwest::{
     header::{HeaderMap, HeaderValue},
-    Client,
+    Client, StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -173,16 +173,39 @@ impl SchwabAuth {
             .send()
             .await?;
 
-        info!("Refresh tokens response status: {:?}", response.status());
+        let status = response.status();
+        info!("Refresh tokens response status: {:?}", status);
 
-        if response.status().is_success() {
+        if status.is_success() {
             info!("Retrieved new tokens successfully using refresh token.");
             let new_token_info: StoredTokenInfo = response.json().await?;
             Ok(new_token_info)
         } else {
-            let error_text = response.text().await?;
+            let error_bytes = response.bytes().await?;
+            let error_text = Self::format_error_body_for_logs(&error_bytes);
+
+            // Schwab returns HTTP 400 when the refresh token is invalid/expired (often `invalid_grant`).
+            // In this state, a full authorization flow is required to obtain a fresh token pair.
+            if status == StatusCode::BAD_REQUEST {
+                let message = if error_text.contains("invalid_grant") {
+                    "Refresh token is no longer valid (invalid_grant). Re-run SchwabAuth::authorize to obtain a new token pair."
+                } else {
+                    "Refresh token request returned HTTP 400. This usually means the refresh token is invalid or expired; re-run SchwabAuth::authorize to obtain a new token pair."
+                };
+                info!("{message}");
+                return Err(anyhow::anyhow!(
+                    "{} Raw response body: {}",
+                    message,
+                    error_text
+                ));
+            }
+
             info!("Failed to refresh tokens: {}", error_text);
-            Err(anyhow::anyhow!("Failed to refresh tokens: {}", error_text))
+            Err(anyhow::anyhow!(
+                "Failed to refresh tokens (status {}): {}",
+                status,
+                error_text
+            ))
         }
     }
 
@@ -313,12 +336,19 @@ impl SchwabAuth {
 
         // Check if the request was successful.
         if !init_token_response.status().is_success() {
-            let error_text = init_token_response.text().await?;
+            let error_bytes = init_token_response.bytes().await?;
+            let error_text = Self::format_error_body_for_logs(&error_bytes);
             return Err(anyhow::anyhow!("Failed to retrieve tokens: {}", error_text));
         }
 
         // Parse the JSON response.
         let json_response: Value = init_token_response.json().await?;
         Ok(json_response)
+    }
+
+    fn format_error_body_for_logs(error_bytes: &[u8]) -> String {
+        let utf8 = String::from_utf8_lossy(error_bytes);
+        let base64_body = general_purpose::STANDARD.encode(error_bytes);
+        format!("utf8={utf8} | base64={base64_body}")
     }
 }

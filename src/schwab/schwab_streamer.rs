@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::anyhow;
@@ -16,9 +17,10 @@ use tokio::{
     net::TcpStream,
     sync::{Mutex, mpsc},
     task::JoinHandle,
+    time::timeout,
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use tracing::{debug, warn};
+use tracing::{debug, warn, trace};
 
 use crate::{
     schwab::{
@@ -288,6 +290,13 @@ pub struct SchwabStreamer {
     streamer_info: Arc<Value>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SchwabStreamerStartConfig {
+    pub connect_timeout: Option<Duration>,
+    pub login_send_timeout: Option<Duration>,
+    pub login_ack_timeout: Option<Duration>,
+}
+
 impl SchwabStreamer {
     pub async fn new(schwab_api: SchwabApi) -> anyhow::Result<Self> {
         let user_preferences: UserPreferencesResponse = schwab_api.get_preferences().await?;
@@ -320,6 +329,14 @@ impl SchwabStreamer {
     }
 
     pub async fn start(&self) -> anyhow::Result<mpsc::Receiver<StreamerMessage>> {
+        self.start_with_config(SchwabStreamerStartConfig::default())
+            .await
+    }
+
+    pub async fn start_with_config(
+        &self,
+        config: SchwabStreamerStartConfig,
+    ) -> anyhow::Result<mpsc::Receiver<StreamerMessage>> {
         let inner_clone = self.inner.clone();
 
         let (tx, rx) = mpsc::channel(100);
@@ -330,9 +347,16 @@ impl SchwabStreamer {
             let token_info = guard.schwab_api.token_info().await;
             let auth_header = token_info.access_token.as_str();
 
-            let (ws_stream, _response) = connect_async(SCHWAB_STREAMER_API_URL)
-                .await
-                .expect("Failed to connect to stream API");
+            let (ws_stream, _response) = if let Some(connect_timeout) = config.connect_timeout {
+                timeout(connect_timeout, connect_async(SCHWAB_STREAMER_API_URL))
+                    .await
+                    .map_err(|_| anyhow!("Timed out connecting to stream API"))?
+                    .expect("Failed to connect to stream API")
+            } else {
+                connect_async(SCHWAB_STREAMER_API_URL)
+                    .await
+                    .expect("Failed to connect to stream API")
+            };
 
             let (mut write, read) = ws_stream.split();
 
@@ -352,17 +376,87 @@ impl SchwabStreamer {
             )?;
 
             debug!("[{:?}] Sending LOGIN request", Utc::now());
-            write
-                .send(Message::Text(message.to_string().into()))
-                .await?;
+            if let Some(login_send_timeout) = config.login_send_timeout {
+                timeout(
+                    login_send_timeout,
+                    write.send(Message::Text(message.to_string().into())),
+                )
+                .await
+                .map_err(|_| anyhow!("Timed out sending LOGIN request"))??;
+            } else {
+                write
+                    .send(Message::Text(message.to_string().into()))
+                    .await?;
+            }
 
             guard.writer = Some(write);
             read
         };
 
+        let wait_for_login_ack = async {
+            loop {
+                let message_result = read
+                    .next()
+                    .await
+                    .ok_or_else(|| anyhow!("WebSocket stream ended before LOGIN response"))?;
+
+                match message_result {
+                    Ok(msg) => {
+                        if let Ok(text) = msg.into_text() {
+                            match serde_json::from_str::<TopLevelMessage>(&text) {
+                                Ok(message) => {
+                                    let mut saw_login_response = false;
+                                    if !message.response.is_empty() {
+                                        let mut guard = inner_clone.lock().await;
+                                        for r in &message.response {
+                                            if r.command == Command::Login {
+                                                saw_login_response = true;
+                                            }
+                                            guard.handle_command_response(r);
+                                        }
+                                    }
+
+                                    if !message.data.is_empty() {
+                                        for streamer_data in message.data {
+                                            let messages: Vec<StreamerMessage> = streamer_data.into();
+                                            for msg in messages {
+                                                if tx.send(msg).await.is_err() {
+                                                    return Err(anyhow!(
+                                                        "Stream receiver dropped before LOGIN ack"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if saw_login_response {
+                                        break Ok(());
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to deserialize message: {}, error: {}", text, e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Error reading from WebSocket stream: {}", e));
+                    }
+                }
+            }
+        };
+
+        if let Some(login_ack_timeout) = config.login_ack_timeout {
+            timeout(login_ack_timeout, wait_for_login_ack)
+                .await
+                .map_err(|_| anyhow!("Timed out waiting for LOGIN response"))??;
+        } else {
+            wait_for_login_ack.await?;
+        }
+
         let listener = tokio::spawn(async move {
             while let Some(message_result) = read.next().await {
-                debug!("READER RECEIVED: {:?}", message_result);
+                trace!("READER RECEIVED: {:?}", message_result);
                 match message_result {
                     Ok(msg) => {
                         if let Ok(text) = msg.into_text() {
